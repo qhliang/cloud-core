@@ -57,7 +57,7 @@ impl TokenUsage {
 }
 
 /// 任务创建请求（cloud-manager → agent-manager `POST /api/v1/tasks`）。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct CreateTaskRequest {
     pub task_id: String,
