@@ -154,6 +154,9 @@ pub struct SkillEntry {
     pub name: String,
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// SKILL.md 全文，随 sync manifest 内联下发，不再走 HTTP 下载。
+    #[serde(default)]
+    pub content: String,
     #[serde(default)]
     pub attachments: Vec<AttachmentEntry>,
 }
@@ -172,6 +175,9 @@ pub struct McpEntry {
     pub name: String,
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// pi `--mcp-config` 格式的 JSON 内容，内联下发。
+    #[serde(default)]
+    pub content: String,
 }
 
 /// Sync manifest 中的 subagent 条目。
@@ -180,6 +186,9 @@ pub struct SubagentEntry {
     pub name: String,
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// subagent markdown 全文（frontmatter + system prompt），内联下发。
+    #[serde(default)]
+    pub content: String,
 }
 
 /// 配置同步响应（cloud-manager `GET /api/sync` → agent-manager）。
