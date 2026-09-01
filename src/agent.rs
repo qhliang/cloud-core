@@ -69,6 +69,9 @@ pub struct CreateTaskRequest {
     #[serde(alias = "subagents")]
     pub agents: Vec<String>,
     pub mcps: Vec<String>,
+    /// 缓存的远程 MCP 工具名（按 MCP 名称分组）；agent-manager 执行时与
+    /// 内置 tools 合并写入 pi `--tools`。旧版本 agent-manager 忽略此字段。
+    pub mcp_tools: HashMap<String, Vec<String>>,
     pub skills: Vec<String>,
     pub files: HashMap<String, String>,
     pub timeout_secs: u64,
