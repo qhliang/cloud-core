@@ -123,6 +123,39 @@ pub struct AgentRuntimeConfig {
     pub extension_policy: String,
     /// 运行模式：true = SandLock 沙箱包裹 Pi，false = 直接执行 Pi。
     pub use_sandbox: bool,
+    /// smol 角色模型规格（低成本/快速工作，如子代理分发）；可选 `:thinking` 后缀。
+    #[serde(default)]
+    pub smol: Option<String>,
+    /// slow 角色模型规格（深度推理）。
+    #[serde(default)]
+    pub slow: Option<String>,
+    /// plan 角色模型规格（计划模式）。
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// advisor 角色模型规格（回合审阅第二模型）。
+    #[serde(default)]
+    pub advisor: Option<String>,
+    /// 启动即进入只读计划模式，直到计划被批准（对应 `--plan-mode`）。
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// 自动批准已提交的计划，用于无人值守运行（对应 `--plan-yolo`）。
+    #[serde(default)]
+    pub plan_yolo: bool,
+    /// 工具审批模式：always-ask（默认）/ write / yolo。
+    #[serde(default)]
+    pub approval_mode: String,
+    /// provider 请求超时秒数；0 表示不设限。默认 60s（云厂商）/ 600s（本地）。
+    #[serde(default)]
+    pub request_timeout_secs: u64,
+    /// 扩展思考级别：off / minimal / low / medium / high / xhigh / max。
+    #[serde(default)]
+    pub thinking: String,
+    /// 覆盖系统提示词。
+    #[serde(default)]
+    pub system_prompt: String,
+    /// 追加到系统提示词（文本内容）。
+    #[serde(default)]
+    pub append_system_prompt: String,
 }
 
 impl Default for AgentRuntimeConfig {
@@ -147,6 +180,17 @@ impl Default for AgentRuntimeConfig {
             artifact_retention_secs: 3600,
             extension_policy: "balanced".to_string(),
             use_sandbox: false,
+            smol: None,
+            slow: None,
+            plan: None,
+            advisor: None,
+            plan_mode: false,
+            plan_yolo: false,
+            approval_mode: "always-ask".to_string(),
+            request_timeout_secs: 60,
+            thinking: "medium".to_string(),
+            system_prompt: String::new(),
+            append_system_prompt: String::new(),
         }
     }
 }
