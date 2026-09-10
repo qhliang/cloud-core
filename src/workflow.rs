@@ -62,6 +62,10 @@ pub struct WorkflowContinueRequest {
     pub nid: String,
     /// 该 act 的产出，回灌为流程变量。
     pub outputs: Vec<VarPair>,
+    /// 非空表示该挂起点**失败**：worker 应使该 act 失败
+    /// （`ActExecutor::fail`）而非完成它。由 cloud-manager 在智能体任务失败 /
+    /// 超时 / 构建请求失败时置位；为空则正常 `complete` 续跑。
+    pub error: Option<String>,
 }
 
 /// 键值对形式的流程变量。
@@ -175,11 +179,26 @@ mod tests {
             tid: "task-1".to_string(),
             nid: "step1".to_string(),
             outputs: vec![VarPair::new("result", "ok")],
+            error: Some("agent task failed".to_string()),
         });
         let raw = serde_json::to_string(&req).expect("serialize");
         assert!(raw.contains("\"type\":\"continue\""), "unexpected: {raw}");
+        assert!(
+            raw.contains("\"error\":\"agent task failed\""),
+            "unexpected: {raw}"
+        );
         let back: WorkflowRequest = serde_json::from_str(&raw).expect("deserialize");
         assert_eq!(back.exec_id(), "exec-1");
+    }
+
+    /// 旧版 producer 不带 `error` 字段时应默认 None（向后兼容）。
+    #[test]
+    fn continue_without_error_defaults_to_none() {
+        let req: WorkflowContinueRequest = serde_json::from_str(
+            r#"{"exec_id":"e1","pid":"p1","tid":"t1","nid":"n1","outputs":[]}"#,
+        )
+        .expect("parse");
+        assert!(req.error.is_none());
     }
 
     #[test]
