@@ -74,6 +74,11 @@ pub struct CreateTaskRequest {
     pub mcp_tools: HashMap<String, Vec<String>>,
     pub skills: Vec<String>,
     pub files: HashMap<String, String>,
+    /// 任务级环境变量，注入 pi 子进程（进而继承给其拉起的 MCP 子进程）。
+    /// 结构整体带 `#[serde(default)]` ⇒ 老版本 agent-manager 发来的载荷缺这个字段也能解析；
+    /// 反过来老版本 agent-manager 收到后会**忽略**它（serde 默认放过未知字段），
+    /// 即「新版 cloud-manager → 老版 agent-manager」只是不生效，不会报错。
+    pub env: HashMap<String, String>,
     pub timeout_secs: u64,
     pub memory_limit_mb: u64,
 }
