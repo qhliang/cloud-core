@@ -187,10 +187,6 @@ pub struct AgentRuntimeConfig {
     /// agent-manager 用它拉取任务初始文件（`GET /internal/agent-task-files`）。
     #[serde(default)]
     pub cloud_manager_url: String,
-    /// 拉取任务初始文件时携带的内部凭据（请求头 `X-Internal-Token`）。
-    /// 由 cloud-manager 生成并随 sync manifest 下发，**不出现**在管理 UI 中。
-    #[serde(default)]
-    pub file_fetch_token: String,
 }
 
 impl Default for AgentRuntimeConfig {
@@ -227,7 +223,6 @@ impl Default for AgentRuntimeConfig {
             system_prompt: String::new(),
             append_system_prompt: String::new(),
             cloud_manager_url: String::new(),
-            file_fetch_token: String::new(),
         }
     }
 }
