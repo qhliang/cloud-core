@@ -74,6 +74,13 @@ pub struct CreateTaskRequest {
     pub mcp_tools: HashMap<String, Vec<String>>,
     pub skills: Vec<String>,
     pub files: HashMap<String, String>,
+    /// 任务初始文件的**引用**（内容存放在 cloud-manager 的 blobstore）。
+    ///
+    /// 与 `files`（内联内容）并存：`files` 兼容历史定义不动，新路径走这里 ——
+    /// 内联内容整包跟随 task-queue payload，受 1 MiB 上限约束；引用体积极小，无此限制。
+    /// 老版本 agent-manager 会忽略该字段（serde 默认放过未知字段）⇒ 不生效但不报错。
+    #[serde(default)]
+    pub file_refs: Vec<TaskFileRef>,
     /// 任务级环境变量，注入 pi 子进程（进而继承给其拉起的 MCP 子进程）。
     /// 结构整体带 `#[serde(default)]` ⇒ 老版本 agent-manager 发来的载荷缺这个字段也能解析；
     /// 反过来老版本 agent-manager 收到后会**忽略**它（serde 默认放过未知字段），
@@ -81,6 +88,21 @@ pub struct CreateTaskRequest {
     pub env: HashMap<String, String>,
     pub timeout_secs: u64,
     pub memory_limit_mb: u64,
+}
+
+/// 任务初始文件的引用：内容在 cloud-manager 的 blobstore，这里只带对象键。
+///
+/// `name` 是落盘相对路径（写入任务 workspace），`blob_key` 是 cloud-manager 侧的
+/// 对象键（`agent-task/{file_uuid}`）。agent-manager 在 spawn pi 之前逐个拉取。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskFileRef {
+    /// workspace 内的落盘相对路径。
+    pub name: String,
+    /// blobstore 对象键，形如 `agent-task/{file_uuid}`。
+    pub blob_key: String,
+    /// 预期字节数，仅用于日志与校验提示。
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// 任务对象（agent-manager 查询/创建响应）。
@@ -161,6 +183,14 @@ pub struct AgentRuntimeConfig {
     /// 追加到系统提示词（文本内容）。
     #[serde(default)]
     pub append_system_prompt: String,
+    /// cloud-manager 的内部基地址，形如 `http://cloud-manager.wasmcloud.svc:80`。
+    /// agent-manager 用它拉取任务初始文件（`GET /internal/agent-task-files`）。
+    #[serde(default)]
+    pub cloud_manager_url: String,
+    /// 拉取任务初始文件时携带的内部凭据（请求头 `X-Internal-Token`）。
+    /// 由 cloud-manager 生成并随 sync manifest 下发，**不出现**在管理 UI 中。
+    #[serde(default)]
+    pub file_fetch_token: String,
 }
 
 impl Default for AgentRuntimeConfig {
@@ -196,6 +226,8 @@ impl Default for AgentRuntimeConfig {
             thinking: "medium".to_string(),
             system_prompt: String::new(),
             append_system_prompt: String::new(),
+            cloud_manager_url: String::new(),
+            file_fetch_token: String::new(),
         }
     }
 }
