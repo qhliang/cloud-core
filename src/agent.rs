@@ -241,11 +241,27 @@ pub struct SkillEntry {
 }
 
 /// skill 附件条目。
+///
+/// 一个 skill 目录里除 `SKILL.md` 外的所有文件都走这里（`references/x.md`、
+/// `scripts/y.py`、图片等），`name` 是**相对 skill 根目录的路径**。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentEntry {
+    /// 相对 skill 根目录的路径，如 `references/aitable.md`。
+    ///
+    /// ⚠️ 落盘方（agent-manager）会把它拼进 `<skills_dir>/<skill>/`，
+    /// 因此**必须**先校验：不许绝对路径、不许 `..`、不许空段
+    /// （否则可写到 skill 目录之外）。协议层不做校验，由两端各自把守。
     pub name: String,
+    /// 文件内容。`binary = false` 时是原文；`true` 时是 **base64**。
     #[serde(default)]
     pub content: String,
+    /// 内容是否为二进制（base64 编码）。
+    ///
+    /// ⚠️ 必须**显式**标记：脚本/配置多为 UTF-8 文本，直接内联最省事；而 `.pyc`、
+    /// 图片、字体不是合法 UTF-8，硬塞进 String 会被替换字符悄悄破坏内容。
+    /// 不用「尝试解码 UTF-8 失败则当二进制」来推断 —— 那样任何一次误判都是静默的数据损坏。
+    #[serde(default)]
+    pub binary: bool,
 }
 
 /// Sync manifest 中的 mcp 条目。
@@ -281,12 +297,27 @@ pub struct BinaryEntry {
     pub name: String,
     /// blobstore 对象键（`agent-binary/<uuid>`），由 cloud-manager 下发。
     pub blob_key: String,
-    /// 字节数，仅用于日志与展示。
+    /// **原始（解压后）**字节数，仅用于日志与展示。
+    ///
+    /// ⚠️ 与 `sha256` 同一基准：两者都描述「落盘后的那个可执行文件」，
+    /// 不是 blobstore 里存的字节。`stored_size` 才是传输/存储侧的体积。
     #[serde(default)]
     pub size: u64,
-    /// 内容摘要（十六进制）。本地 sidecar 与之一致即跳过下载。
+    /// **原始（解压后）**内容的摘要（十六进制）。本地 sidecar 与之一致即跳过下载。
+    ///
+    /// ⚠️ 校验发生在**解压之后**：agent-manager 拿到的是压缩内容，必须先解压再算摘要。
     #[serde(default)]
     pub sha256: String,
+    /// blobstore 中实际存储的字节数（压缩后）。仅用于日志与带宽核算；0 表示未知。
+    #[serde(default)]
+    pub stored_size: u64,
+    /// 传输/存储编码：空串 = 原样存储；`"gzip"` = blobstore 里是 gzip 流，
+    /// agent-manager 必须先解压再校验 `sha256` / 落盘。
+    ///
+    /// ⚠️ 取值必须与 cloud-manager 侧常量一致；未知取值应按**原样**处理并告警，
+    /// 不要猜测解压 —— 猜错会把压缩流当成可执行文件写进 PATH。
+    #[serde(default)]
+    pub encoding: String,
     #[serde(default)]
     pub updated_at: Option<i64>,
 }
