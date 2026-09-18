@@ -270,7 +270,31 @@ pub struct SubagentEntry {
     pub content: String,
 }
 
+/// Sync manifest 中的可执行程序（Linux ELF 二进制）条目。
+///
+/// 与 skills / mcp 不同，这里**只发元数据、不发内容**：二进制动辄几十 MiB，
+/// 而 manifest 要走 NATS KV（value 有大小上限，且已内联 skills/subagents 全文）。
+/// agent-manager 据此判断本地是否需要重新下载，内容按需走 HTTP 拉取。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BinaryEntry {
+    /// 文件名，落到 `<bin_dir>/<name>`，也是 PATH 里的调用名。
+    pub name: String,
+    /// blobstore 对象键（`agent-binary/<uuid>`），由 cloud-manager 下发。
+    pub blob_key: String,
+    /// 字节数，仅用于日志与展示。
+    #[serde(default)]
+    pub size: u64,
+    /// 内容摘要（十六进制）。本地 sidecar 与之一致即跳过下载。
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
 /// 配置同步响应（cloud-manager `GET /api/sync` → agent-manager）。
+///
+/// ⚠️ 新增字段一律带 `#[serde(default)]`：agent-manager 与 cloud-manager 是分别部署的，
+/// 新旧版本会短暂共存（旧 agent-manager 解析新 manifest 时不能因为未知字段而失败）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncManifest {
     #[serde(default)]
@@ -283,6 +307,9 @@ pub struct SyncManifest {
     pub mcp: Vec<McpEntry>,
     #[serde(default)]
     pub subagents: Vec<SubagentEntry>,
+    /// 已启用的可执行程序清单（仅元数据）。
+    #[serde(default)]
+    pub binaries: Vec<BinaryEntry>,
 }
 
 /// 状态回推请求体（agent-manager → cloud-manager `POST /api/agent/status`）。
