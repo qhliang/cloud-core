@@ -244,6 +244,16 @@ pub struct SkillEntry {
 ///
 /// 一个 skill 目录里除 `SKILL.md` 外的所有文件都走这里（`references/x.md`、
 /// `scripts/y.py`、图片等），`name` 是**相对 skill 根目录的路径**。
+///
+/// ⚠️ 这一个类型服务两个方向，靠字段分工区分（0.1.9 起）：
+/// - **上传请求**（`POST /api/skills/upload`）带 `content`（内容内联，binary 时是 base64）；
+/// - **sync manifest** 不带 `content`，只带 `blob_key` + `size` + `sha256`，内容由
+///   agent-manager 走 `GET /internal/skill-attachments?key=` 按需下载。
+///
+/// 为什么不拆成两个类型：拆开会让**旧 agent-manager** 反序列化 `SkillEntry` 时
+/// 因字段不匹配而**整条 skill 落不下来**；而现在这样（同名同型、字段全 default）
+/// 旧进程至少能解析成功。⚠️ 但旧进程会把 `content` 读成空串 ⇒ **写出空附件文件**
+/// —— 所以**必须先升级 agent-manager、再升级 cloud-manager**（见 README 的发布顺序）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentEntry {
     /// 相对 skill 根目录的路径，如 `references/aitable.md`。
@@ -252,16 +262,40 @@ pub struct AttachmentEntry {
     /// 因此**必须**先校验：不许绝对路径、不许 `..`、不许空段
     /// （否则可写到 skill 目录之外）。协议层不做校验，由两端各自把守。
     pub name: String,
-    /// 文件内容。`binary = false` 时是原文；`true` 时是 **base64**。
-    #[serde(default)]
+    /// 文件内容（**仅上传请求使用**）。`binary = false` 时是原文；`true` 时是 **base64**。
+    ///
+    /// ⚠️ manifest 下发时该字段恒为空：附件动辄几百 KiB、一个 skill 可带 500 个，
+    /// 内联会同时撑爆 D1 单行上限与 NATS KV 的 value 上限。
+    /// 空串**不序列化**（`skip_serializing_if`）—— 让「manifest 里不该出现 content」
+    /// 这条约束在产物上就看得见，而不是靠人记得。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     /// 内容是否为二进制（base64 编码）。
     ///
     /// ⚠️ 必须**显式**标记：脚本/配置多为 UTF-8 文本，直接内联最省事；而 `.pyc`、
     /// 图片、字体不是合法 UTF-8，硬塞进 String 会被替换字符悄悄破坏内容。
     /// 不用「尝试解码 UTF-8 失败则当二进制」来推断 —— 那样任何一次误判都是静默的数据损坏。
+    ///
+    /// ⚠️ 它与 `blob_key` 指向的对象**编码无关**：那个对象里的字节永远是**落盘时的原始
+    /// 字节**（不是 base64），`binary` 只描述「该文件是不是二进制」。
+    /// 早期实现把它当成「内容是 base64」，走 blobstore 后该含义已不适用。
     #[serde(default)]
     pub binary: bool,
+    /// blobstore 对象键（`skill-attachment/<skill_id>/<序号>`），由 cloud-manager 下发。
+    ///
+    /// ⚠️ 空串表示「该条目没有 blob」：要么来自**旧版 cloud-manager**（内容在 `content`
+    /// 里内联），要么是 manifest 与内容不同步的异常态。读取方必须**按空前缀处理并回退到
+    /// `content`** —— 不能假定它非空，否则升级期会写出空文件。
+    #[serde(default)]
+    pub blob_key: String,
+    /// 落盘后的**原始字节数**（二进制附件即解码后的长度，不是 base64 长度）。仅用于日志与展示。
+    #[serde(default)]
+    pub size: u64,
+    /// **原始字节**的摘要（十六进制小写）。本地已有同摘要的文件即跳过下载。
+    ///
+    /// ⚠️ 与 `size` 同一基准：都描述「落盘后的那个文件」，不是 blobstore 里的对象。
+    #[serde(default)]
+    pub sha256: String,
 }
 
 /// Sync manifest 中的 mcp 条目。
@@ -396,4 +430,81 @@ pub struct ArtifactEntry {
     pub content_base64: String,
     #[serde(default)]
     pub size: u64,
+}
+
+#[cfg(test)]
+mod attachment_compat_tests {
+    use super::*;
+
+    /// ⚠️ **升级期的兼容性守门测试**：agent-manager 与 cloud-manager 分别部署，
+    /// 一定会出现「新 agent-manager 读旧 manifest」的窗口。旧形态是内容内联
+    /// （`content` 有值、`blob_key` 不存在），必须仍能解析出完整条目。
+    #[test]
+    fn old_inline_attachment_still_deserializes() {
+        let json = r#"{"name":"references/a.md","content":"hello","binary":false}"#;
+        let a: AttachmentEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(a.name, "references/a.md");
+        assert_eq!(a.content, "hello");
+        assert!(!a.binary);
+        // 旧形态没有 blob_key ⇒ 读取方必须回退到 content（这就是兼容窗口的关键）。
+        assert!(a.blob_key.is_empty(), "旧条目不该凭空产出 blob_key");
+        assert_eq!(a.size, 0);
+        assert!(a.sha256.is_empty());
+    }
+
+    /// 新形态：只带元数据，`content` 缺失也必须能解析（不能因为缺字段而整条失败）。
+    #[test]
+    fn metadata_only_attachment_deserializes_without_content() {
+        let json = r#"{"name":"scripts/run.py","blob_key":"skill-attachment/sk_1/0",
+                       "size":42,"sha256":"ab","binary":false}"#;
+        let a: AttachmentEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(a.blob_key, "skill-attachment/sk_1/0");
+        assert_eq!(a.size, 42);
+        assert_eq!(a.sha256, "ab");
+        assert!(a.content.is_empty());
+    }
+
+    /// 极简形态（只有 `name`）不能 panic —— 早期/被裁剪的 manifest 也要能读。
+    #[test]
+    fn minimal_attachment_is_tolerated() {
+        let a: AttachmentEntry = serde_json::from_str(r#"{"name":"x.md"}"#).unwrap();
+        assert_eq!(a.name, "x.md");
+        assert!(a.content.is_empty() && a.blob_key.is_empty() && a.sha256.is_empty());
+    }
+
+    /// 整个 `SkillEntry` 在两种形态下都要能读（旧/新 agent-manager 各自的视角）。
+    #[test]
+    fn skill_entry_reads_both_shapes() {
+        let old = r#"{"name":"a","updated_at":1,"content":"---\nname: a\n---\n","attachments":[
+            {"name":"r/x.md","content":"inline","binary":false}]}"#;
+        let s: SkillEntry = serde_json::from_str(old).unwrap();
+        assert_eq!(s.attachments[0].content, "inline");
+        assert!(s.attachments[0].blob_key.is_empty());
+
+        let new = r#"{"name":"a","updated_at":1,"content":"---\nname: a\n---\n","attachments":[
+            {"name":"r/x.md","blob_key":"skill-attachment/sk_1/0","size":6,"sha256":"ff","binary":false}]}"#;
+        let s: SkillEntry = serde_json::from_str(new).unwrap();
+        assert_eq!(s.attachments[0].blob_key, "skill-attachment/sk_1/0");
+        assert!(s.attachments[0].content.is_empty());
+    }
+
+    /// 序列化新条目时不该把 `content` 也写出去（否则 KV 里白占体积）——
+    /// 这是「manifest 只发元数据」这条约束的可执行判据。
+    #[test]
+    fn metadata_only_entry_serializes_without_content_payload() {
+        let a = AttachmentEntry {
+            name: "r/x.md".into(),
+            content: String::new(),
+            binary: false,
+            blob_key: "skill-attachment/sk_1/0".into(),
+            size: 6,
+            sha256: "ff".into(),
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("skill-attachment/sk_1/0"));
+        assert!(
+            !s.contains("\"content\""),
+            "空的 content 不该出现在 manifest 里: {s}"
+        );
+    }
 }
