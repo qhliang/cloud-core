@@ -88,6 +88,35 @@ pub struct CreateTaskRequest {
     pub env: HashMap<String, String>,
     pub timeout_secs: u64,
     pub memory_limit_mb: u64,
+    // ── 会话复用（session reuse）──────────────────────────────────────────
+    //
+    // ⚠️ `task_id` 依然是**执行记录 ID**（队列去重 + 状态/产物上报键），
+    // 这里额外带上「业务任务 ID」用于派生任务目录 —— 两者语义不同，**不可互换**：
+    // 若把 `task_id` 换成业务任务 ID，同一任务第二次执行会被队列去重当成
+    // 「已在运行」直接丢弃（`task_queue.rs` 按 `task_id` 去重）。
+    //
+    // 全部字段受外层 `#[serde(default)]` 保护：
+    // 老版本 cloud-manager 发来的载荷缺字段也能解析；老版本 agent-manager 收到后
+    // 会忽略未知字段 ⇒ 降级为「无会话」，不会报错（这是刻意选择的失败方向）。
+    /// 是否启用会话复用。
+    pub session_enabled: bool,
+    /// 任务目录派生键（业务任务 ID，`tk_<hex>`）。
+    ///
+    /// ⚠️ **必须由它（而非执行 ID）派生 workspace 路径**：pi 的会话按进程 cwd 索引
+    /// （实测 `~/.pi/agent/sessions/--<转义 cwd>--/`），路径一变就认不出旧会话。
+    /// 留空 = 退化为按执行 ID 派生（旧行为）。
+    pub session_dir_key: String,
+    /// 云端上一版会话包的**内容 hash**（见 `content_hash` 的约定）。
+    /// 空串 = 云端还没有会话包 ⇒ 无需比对，直接全新开始。
+    pub session_hash: String,
+    /// 云端会话包的对象键（`agent-session/<task_id>`）；空串 = 无包可拉。
+    pub session_blob_key: String,
+    /// 会话包下载的随机凭据（`st_<uuid4>`）。
+    ///
+    /// ⚠️ 对象键用的是**任务 ID**，而 task_id 是 `tk_<毫秒时间戳 hex>` —— **可预测**，
+    /// 无法像 `tf_`/`bn_` 那样凭 uuid 的随机性承担 capability URL 的准入。
+    /// 故另发一个随机凭据，worker 拉取时一并提供。
+    pub session_token: String,
 }
 
 /// 任务初始文件的引用：内容在 cloud-manager 的 blobstore，这里只带对象键。
@@ -505,6 +534,61 @@ mod attachment_compat_tests {
         assert!(
             !s.contains("\"content\""),
             "空的 content 不该出现在 manifest 里: {s}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_field_compat_tests {
+    use super::*;
+
+    /// ⚠️ **会话功能的兼容性守门测试**：cloud-manager 与 agent-manager 分别部署，
+    /// 必然出现「新 payload → 老 worker」和「老 payload → 新 worker」两个窗口。
+    /// 两个方向都必须**降级而非报错**（刻意选择的失败方向：丢会话能力 > 任务起不来）。
+    #[test]
+    fn old_payload_without_session_fields_keeps_parsing() {
+        let json = r#"{"task_id":"exec-1","prompt":"hi"}"#;
+        let r: CreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.task_id, "exec-1");
+        assert!(!r.session_enabled, "缺省必须是「未启用」，不能默认开");
+        assert!(r.session_dir_key.is_empty());
+        assert!(r.session_hash.is_empty());
+        assert!(r.session_blob_key.is_empty());
+    }
+
+    /// 会话字段齐全时正常落地 —— 防止有人手滑把 `#[serde(default)]` 弄丢
+    /// （那样会变成「老 payload 解析失败 ⇒ 任务直接起不来」）。
+    #[test]
+    fn session_fields_round_trip() {
+        let r = CreateTaskRequest {
+            task_id: "exec-1".into(),
+            prompt: "p".into(),
+            session_enabled: true,
+            session_dir_key: "tk_abc123".into(),
+            session_hash: "sha256hex".into(),
+            session_blob_key: "agent-session/tk_abc123".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: CreateTaskRequest = serde_json::from_str(&json).unwrap();
+        assert!(back.session_enabled);
+        assert_eq!(back.session_dir_key, "tk_abc123");
+        assert_eq!(back.session_hash, "sha256hex");
+        assert_eq!(back.session_blob_key, "agent-session/tk_abc123");
+    }
+
+    /// ⚠️ 会话字段**不得**顶替 `task_id`：后者是队列去重 + 状态/产物上报键。
+    /// 这条一旦被违反，症状是「同一任务第二次执行被当成运行中丢弃」—— 静默吞任务。
+    #[test]
+    fn task_id_is_still_the_execution_id() {
+        let json = r#"{"task_id":"exec-9","prompt":"hi",
+                       "session_enabled":true,"session_dir_key":"tk_xyz"}"#;
+        let r: CreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.task_id, "exec-9");
+        assert_eq!(r.session_dir_key, "tk_xyz");
+        assert_ne!(
+            r.task_id, r.session_dir_key,
+            "task_id 与 session_dir_key 必须是两套 id"
         );
     }
 }
