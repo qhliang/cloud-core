@@ -126,6 +126,11 @@ impl WorkflowStatus {
 ///
 /// 挂起点的 `nid` 以 `WorkflowResultEnvelope` 为准（随 task output 一起回传），
 /// 心跳仅作进度观察，不参与控制流。
+///
+/// `logs` 为执行期消息批次（worker 攒批上报，best-effort、允许缺口）：
+/// client 侧按 `exec_id` 把各批次按序合并成「过程日志」，终态归档到 blobstore。
+/// 心跳 `info` 有 8 KiB 上限（task_queue_core `HEARTBEAT_MAX_INFO_BYTES`），
+/// 批次必须按预算拆分。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct WorkflowProgress {
@@ -134,6 +139,24 @@ pub struct WorkflowProgress {
     pub phase: WorkflowPhase,
     /// 当前 act 的 node id。
     pub node: Option<String>,
+    /// 执行期消息批次（本批新增；`None` = 本心跳不带日志）。
+    pub logs: Option<Vec<WorkflowLogEntry>>,
+}
+
+/// 一条过程日志。`text` 已是渲染后的最终文本（如 log 步骤求值后的 message）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct WorkflowLogEntry {
+    /// worker 收到消息的时刻（Unix 毫秒）。
+    pub ts_ms: u64,
+    /// 消息所属的 node id。
+    pub nid: String,
+    /// 消息所属的 acts 包 id（如 `acts.core.msg` / `workflow.agent`）。
+    pub uses: String,
+    /// `info` | `error`。
+    pub level: String,
+    /// 日志文本。
+    pub text: String,
 }
 
 /// 执行阶段。
