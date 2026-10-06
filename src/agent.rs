@@ -117,6 +117,17 @@ pub struct CreateTaskRequest {
     /// 无法像 `tf_`/`bn_` 那样凭 uuid 的随机性承担 capability URL 的准入。
     /// 故另发一个随机凭据，worker 拉取时一并提供。
     pub session_token: String,
+    // ── WebUI 在线对话的结构化 trace（§12.13.4）──────────────────────────
+    //
+    // ⚠️ 为何要传「会话 id + 消息 id」两个值，而不是让 agent-manager 自己推：
+    // 这两个 id 的语义完全属于 cloud-manager 侧的业务模型（会话 = agent_tasks 行、
+    // 消息 = chat_messages 行），agent-manager 拿不到也不该猜。留空 = 不采集 trace，
+    // 老版本 cloud-manager 发来的载荷也能解析（外层已有 `#[serde(default)]`）。
+    /// 对话**会话** id（= `agent_tasks.id`，`tk_<hex>`）。非空 = 本轮是对话轮次。
+    pub chat_session_id: String,
+    /// 本轮的 assistant **消息** id（= `chat_messages.id`，`mid_…`）。
+    /// trace 以它为 blobstore 对象键 `chat-trace/<chat_session_id>/<chat_message_id>`。
+    pub chat_message_id: String,
 }
 
 /// 任务初始文件的引用：内容在 cloud-manager 的 blobstore，这里只带对象键。
