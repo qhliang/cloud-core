@@ -130,6 +130,76 @@ pub struct CreateTaskRequest {
     pub chat_message_id: String,
 }
 
+/// 在线对话的**追问**：本轮执行**进行中**追加的一条用户消息。
+///
+/// ## 为什么单独一个类型、而不是复用 `CreateTaskRequest`
+/// 追问**不派发新任务**（不新建队列 task、不抢会话锁、不新建 assistant 消息行），
+/// 它只是往**正在跑的这一轮**的 stdin 上再写一行 RPC。因此它需要的字段集合与
+/// 「一次任务下发」完全不同：没有 model / skills / mcps / 超时 / 内存上限，
+/// 却多了「属于哪一轮」这个定位信息。
+///
+/// ## 存放位置与生命周期
+/// 存于 NATS KV `chat_followup.<chat_message_id>.<seq>`（每条一个键 ⇒ 生产者
+/// 只做纯写入，没有读-改-写竞态；这是与 `chat_stream.<mid>` 的关键区别）。
+/// agent-manager 消费后删除；轮次终态时 cloud-manager 前缀扫描清理残留。
+///
+/// ⚠️ **KV 没有 per-key TTL**（NATS `Allows Per-Message TTL: false`），
+/// 所以 `created_at_ms` 不是冗余字段：它是 cron 判定孤儿键的唯一依据。
+/// 没有它，进程崩溃留下的键会永远躺在 bucket 里。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatFollowup {
+    /// 所属轮次的 assistant 消息 id（= `CreateTaskRequest.chat_message_id`）。
+    ///
+    /// ⚠️ 键里已经含了它，这里**冗余**存一份是刻意的：值因此自洽 ——
+    /// dump 任意一个键就能读出「这条追问属于哪一轮」，不必去解析键名；
+    /// 写路径也不必先查一次会话锁再拼键。
+    pub chat_message_id: String,
+    /// 这条追问对应的 `chat_messages.id`（`role='user'` 行）。
+    pub user_message_id: String,
+    /// 对应的 `chat_messages.seq`，同时是 KV 键的排序后缀（决定投递顺序）。
+    pub seq: i64,
+    /// 追问正文。附件另走 `file_refs`，正文里由 agent-manager 追加文件名提示。
+    #[serde(default)]
+    pub content: String,
+    /// **仅本条追问**的附件引用（不含会话历史附件）。
+    ///
+    /// ⚠️ 不能直接复用首轮的 `CreateTaskRequest.file_refs`——那是会话文件库的
+    /// 全量快照；首轮已在 spawn 前拉取过，再拉一遍会把历史附件重复覆盖写进 workspace。
+    #[serde(default)]
+    pub file_refs: Vec<TaskFileRef>,
+    /// 写入时刻（epoch 毫秒），供孤儿键回收判定。
+    #[serde(default)]
+    pub created_at_ms: u64,
+}
+
+/// 追问在 KV 里的键前缀。
+///
+/// ⚠️ 与 `chat_stream.` / `chat_lock.` / `chat_task_map.` **互不为前缀**，
+/// 否则前缀扫描会互相命中（这是 `kv.rs` 里那批常量必须成组核对的原因）。
+pub const CHAT_FOLLOWUP_KV_PREFIX: &str = "chat_followup.";
+
+/// 由 assistant 消息 id 推出追问键的**前缀**（末尾带 `.`）。
+///
+/// ## 为什么放在 cloud-core 而不是各自拼字符串
+/// 生产者（cloud-manager 写）与消费者（agent-manager 按前缀 list）必须对前缀
+/// **逐字节一致**。两边各拼一份是典型的漂移源：改了一边，另一边静默地
+/// 什么都读不到 —— 表现为「追问永远投不出去」，且没有任何报错。
+///
+/// agent-manager 侧无需 `CreateTaskRequest` 新增字段：它已经有
+/// `chat_message_id`，直接调本函数即可，协议保持向后兼容。
+pub fn chat_followup_kv_prefix(chat_message_id: &str) -> String {
+    format!("{CHAT_FOLLOWUP_KV_PREFIX}{chat_message_id}.")
+}
+
+/// 单条追问的完整 KV 键。
+///
+/// ⚠️ `seq` 用 `{:012}` 补零，使**字典序 == 数值序**。agent-manager 侧对
+/// `keys()` 的返回值排序后即为投递顺序；不补零的话 `10` 会排在 `9` 前面
+/// （追问顺序错乱，且这种错乱不会报错，只表现为「模型先回答后问的那句」）。
+pub fn chat_followup_kv_key(chat_message_id: &str, seq: i64) -> String {
+    format!("{}{chat_message_id}.{seq:012}", CHAT_FOLLOWUP_KV_PREFIX)
+}
+
 /// 任务初始文件的引用：内容在 cloud-manager 的 blobstore，这里只带对象键。
 ///
 /// `name` 是落盘相对路径（写入任务 workspace），`blob_key` 是 cloud-manager 侧的
@@ -601,5 +671,110 @@ mod session_field_compat_tests {
             r.task_id, r.session_dir_key,
             "task_id 与 session_dir_key 必须是两套 id"
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_followup_tests {
+    use super::*;
+
+    /// 追问结构体往返 —— 两端（cloud-manager 写 / agent-manager 读）共用它，
+    /// 序列化契约一旦漂移就是「键写进去了但读出来是空的」。
+    #[test]
+    fn followup_round_trip() {
+        let f = ChatFollowup {
+            chat_message_id: "mid_xyz".into(),
+            user_message_id: "msg_abc".into(),
+            seq: 7,
+            content: "改成只回答 5".into(),
+            file_refs: vec![TaskFileRef {
+                name: "a.png".into(),
+                blob_key: "agent-task/tf_1".into(),
+                size: 12,
+            }],
+            created_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let back: ChatFollowup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+    }
+
+    /// 缺省字段必须能补齐：老版本 cloud-manager 不会发这些字段，
+    /// 缺失时应当降级成「无附件 / 无时间戳」，而不是解析失败把整轮搞崩。
+    ///
+    /// ⚠️ `chat_message_id` **故意不给 `#[serde(default)]`** —— 它是定位键，
+    /// 缺了它连 KV 键都拼不出来，那种情况必须解析失败（早失败）而不是
+    /// 悄悄写出一个 `chat_followup..000000000000` 的孤儿键。
+    #[test]
+    fn followup_tolerates_missing_optional_fields() {
+        let f: ChatFollowup = serde_json::from_str(
+            r#"{"chat_message_id":"mid_1","user_message_id":"msg_1","seq":3,"content":"hi"}"#,
+        )
+        .unwrap();
+        assert!(f.file_refs.is_empty());
+        assert_eq!(f.created_at_ms, 0);
+        assert_eq!(f.content, "hi");
+    }
+
+    /// 缺 `chat_message_id` 必须解析失败（见上一条的注释）。
+    #[test]
+    fn followup_requires_chat_message_id() {
+        let r: Result<ChatFollowup, _> =
+            serde_json::from_str(r#"{"user_message_id":"msg_1","seq":3}"#);
+        assert!(r.is_err(), "缺定位键必须早失败，不能默默拼出孤儿 KV 键");
+    }
+
+    /// ⚠️ **键序契约**：补零必须让字典序 == 数值序。
+    /// 这条一旦被破坏，追问会以「先回答后问的那句」的顺序送达模型 ——
+    /// 不报错、不崩溃，只是答案莫名其妙，因此必须由测试钉死。
+    #[test]
+    fn followup_key_orders_lexicographically_by_seq() {
+        let mid = "mid_1";
+        let mut keys: Vec<String> = [2i64, 10, 9, 100, 1]
+            .iter()
+            .map(|s| chat_followup_kv_key(mid, *s))
+            .collect();
+        keys.sort();
+        let order: Vec<i64> = keys
+            .iter()
+            .map(|k| k.rsplit('.').next().unwrap().parse::<i64>().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec![1, 2, 9, 10, 100],
+            "字典序必须等于数值序: {keys:?}"
+        );
+    }
+
+    /// 前缀扫描的边界：`<mid>.` 之下必须能命中本轮全部追问，
+    /// 且**不能**命中 `chat_stream.` / `chat_lock.` 那批同族键。
+    #[test]
+    fn followup_prefix_is_scannable_and_namespaced() {
+        let mid = "mid_xyz";
+        let prefix = chat_followup_kv_prefix(mid);
+        assert!(chat_followup_kv_key(mid, 0).starts_with(&prefix));
+        assert_eq!(prefix, "chat_followup.mid_xyz.");
+
+        // 同族前缀互不命中（改前缀常量时重新核对这一条）。
+        for other in ["chat_stream.", "chat_lock.", "chat_task_map.", "chat_del."] {
+            assert!(
+                !prefix.starts_with(other),
+                "追问前缀不得与 {other} 互为前缀"
+            );
+        }
+    }
+
+    /// ⚠️ **跨 id 不串**：另一个 mid 的追问键不得被本轮的 list 命中，
+    /// 否则用户 A 的追问会被投进用户 B 的对话。
+    #[test]
+    fn followup_prefix_does_not_cross_message_ids() {
+        let mine = chat_followup_kv_prefix("mid_aaa");
+        let theirs = chat_followup_kv_key("mid_bbb", 0);
+        assert!(
+            !theirs.starts_with(&mine),
+            "mid_aaa 的前缀不得命中 mid_bbb 的键"
+        );
+        // 反向也要成立：id 是变长的，前缀匹配不能只比开头几个字符。
+        assert!(!chat_followup_kv_key("mid_aa", 0).starts_with(&mine));
     }
 }
