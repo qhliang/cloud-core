@@ -128,6 +128,18 @@ pub struct CreateTaskRequest {
     /// 本轮的 assistant **消息** id（= `chat_messages.id`，`mid_…`）。
     /// trace 以它为 blobstore 对象键 `chat-trace/<chat_session_id>/<chat_message_id>`。
     pub chat_message_id: String,
+    /// 本轮那条 **user 消息**的 id（= `chat_messages.id`，`msg_…`）。
+    ///
+    /// ## 为什么需要它
+    /// 一个轮次的 trace（= 唯一的压缩归档文件）里同时装着
+    /// 「这一轮的用户输入」「助手的思考/工具/正文」「执行中追加的追问」。
+    /// 用户输入与追问都以 `message_id` 标注自己的来源消息行，前端据此把
+    /// 正文精确配回对应的 user 消息 —— 不用靠「第几条 followup」这种脆弱的
+    /// 下标推断。
+    ///
+    /// 留空 = 不写 `user_message` 行（老 cloud-manager 下发的载荷仍可解析）。
+    #[serde(default)]
+    pub chat_user_message_id: String,
 }
 
 /// 在线对话的**追问**：本轮执行**进行中**追加的一条用户消息。
@@ -656,6 +668,32 @@ mod session_field_compat_tests {
         assert_eq!(back.session_dir_key, "tk_abc123");
         assert_eq!(back.session_hash, "sha256hex");
         assert_eq!(back.session_blob_key, "agent-session/tk_abc123");
+    }
+
+    /// ⚠️ 老 cloud-manager 不下发 `chat_user_message_id` ⇒ 必须降级为
+    /// 「不写 user_message 行」，而不是解析失败把整个轮次搞挂。
+    #[test]
+    fn old_payload_without_chat_user_message_id_keeps_parsing() {
+        let json = r#"{"task_id":"exec-1","prompt":"hi","chat_session_id":"tk_1","chat_message_id":"mid_1"}"#;
+        let r: CreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.chat_message_id, "mid_1");
+        assert!(
+            r.chat_user_message_id.is_empty(),
+            "缺省必须是空串（=不写 user_message 行），不能编一个"
+        );
+    }
+
+    /// ⚠️ `chat_user_message_id` 与 `chat_message_id` 是**两套 id**，不得互相顶替：
+    /// 前者是 user 消息行、后者是 assistant 消息行。把它们混掉会让 trace 的
+    /// `message_id` 标错来源，前端把正文配到错误的行上（且不报错）。
+    #[test]
+    fn chat_user_message_id_is_distinct_from_chat_message_id() {
+        let json = r#"{"task_id":"exec-1","prompt":"hi","chat_session_id":"tk_1",
+                       "chat_message_id":"mid_asst","chat_user_message_id":"msg_user"}"#;
+        let r: CreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.chat_message_id, "mid_asst");
+        assert_eq!(r.chat_user_message_id, "msg_user");
+        assert_ne!(r.chat_message_id, r.chat_user_message_id);
     }
 
     /// ⚠️ 会话字段**不得**顶替 `task_id`：后者是队列去重 + 状态/产物上报键。
