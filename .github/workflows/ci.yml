@@ -63,6 +63,43 @@ jobs:
       - name: Cargo test
         run: cargo test --workspace
 
+  # 检出声明了却没用到的依赖。
+  #
+  # 本仓的依赖面有个具体风险：根包必须保持「纯协议类型」，AGENTS.md 明令
+  # 不得引入 async-nats / tokio 之类运行时依赖。有人若在根包
+  # Cargo.toml 里加了又忘了从 lib.rs 删掉，编译与测试都照样绿，
+  # 只有 wasm-root job 会在更后面、也更隐晦的地方报警 —— machete 直接
+  # 指出「声明未用」。
+  #
+  # 版本锁 0.9（本地验证过的版本），避免上游发新版时 CI 行为突变。
+  machete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: taiki-e/install-action@cargo-machete@0.9
+      # --with-metadata：按 cargo metadata 解析依赖名，规避重命名依赖
+      # （xml-rs → xml 之类）造成的误报。实测本仓 0 findings。
+      #
+      # ⚠️ 额外守一道：cargo-machete 0.9 在 `cargo metadata` **失败时仍返回
+      # exit 0**，只把 "error when handling ..." 打到 stderr。实测：注入一个
+      # 解析不了的依赖版本后，它一边刷错误一边报 "didn't find any unused
+      # dependencies" 并 exit 0 —— 静默放行。所以显式把这行捞出来判失败，
+      # 否则这个 job 在 workspace 解析出错时会假装通过。
+      - name: Detect unused dependencies
+        run: |
+          set -o pipefail
+          output=$(cargo machete --with-metadata 2>&1) || {
+            echo "$output"
+            exit 1
+          }
+          if echo "$output" | grep -q "error when handling"; then
+            echo "$output"
+            echo "::error::cargo metadata 解析失败，machete 结论不可信"
+            exit 1
+          fi
+          echo "$output"
+
   # 根包必须保持 WASM 可编译。
   #
   # tokengateway 仍是 WASM 组件，依赖的是**根包**（不是 cloud-core-queue）。

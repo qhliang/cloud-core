@@ -53,13 +53,20 @@ crate，带运行时依赖（async-nats / tokio）；根包刻意**不**引入�
 
 ## CI
 
-本仓有 `.github/workflows/ci.yml`，4 个 job，**只检查本仓自身、不拉任何外部仓库**：
+本仓有 `.github/workflows/ci.yml`，5 个 job，**只检查本仓自身、不拉任何外部仓库**：
 
 | job | 检查什么 |
 |---|---|
 | `fmt` / `clippy` | `--workspace`（根包 + cloud-core-queue） |
 | `test` | `cargo test --workspace` |
+| `machete` | 检出声明了却没用到的依赖 |
 | `wasm-root` | 根包编到 `wasm32-wasip2` —— 守护「根包不得引入运行时依赖」 |
+
+⚠️ **`machete` job 有一段额外保护**：cargo-machete 0.9 在 `cargo metadata`
+**失败时仍返回 exit 0**（只把 `error when handling ...` 打到 stderr，然后照样
+报 "didn't find any unused dependencies"）。所以该 job 显式捕获这行并判失败 ——
+否则 workspace 解析出错时它会假装通过。误报可加
+`[package.metadata.cargo-machete] ignored = [...]` 抑制。
 
 ⚠️ **不设跨仓兼容性 job**：下游仓（agent-manager / workflow-manager /
 tokengateway）的编译检查由它们各自的 CI 负责，本仓不重复。
