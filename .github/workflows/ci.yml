@@ -26,7 +26,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # ⚠️ components: clippy 不能省 —— dtolnay/rust-toolchain 默认按 minimal
+      # profile 安装，不含 clippy/rustfmt，漏了会在 CI 上报
+      # "'cargo-clippy' is not installed for the toolchain"。
       - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
@@ -81,11 +86,15 @@ jobs:
       # 只编根包：cloud-core-queue 带 async-nats，本就不该进 WASM。
       - name: Build root package for wasm32-wasip2
         run: cargo build -p cloud-core --target wasm32-wasip2
-
   # agent-manager / workflow-manager 从本仓 origin/main 拉取依赖。
-  # 本仓编译不过时，是**下游两个仓先炸**而本仓一声不响（它们只会在
-  # 解析依赖时报错）。本 job 让问题在这里先暴露。
+  # 本仓编译不过时，是**下游两个仓先炸**而本仓一声不响（它们只会在解析依赖
+  # 时报错，指向自己的仓库、查不到真正的原因）。本 job 让问题在这里先暴露。
+  #
+  # ⚠️ 需要 PAT：下游两仓是**私有仓**，默认 GITHUB_TOKEN 只对当前仓有效，
+  # `actions/checkout` 会报 "Repository not found"。凭据缺失时整个 job 跳过
+  # （不阻塞主线 CI）—— 想启用请配 secret：CROSS_REPO_TOKEN（contents: read）
   consumers-resolve:
+    if: ${{ secrets.CROSS_REPO_TOKEN != '' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -98,6 +107,7 @@ jobs:
           repository: qhliang/${{ matrix.consumer }}
           ref: main
           path: consumer
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
       # 无需软链：两个 checkout 分别落在 $GITHUB_WORKSPACE/{consumer,cloud-core}，
       # 天然是兄弟目录 —— consumer 的 `path = "../cloud-core"` 正好解析到后者。
       - name: Checkout cloud-core (simulated origin/main)
@@ -111,8 +121,8 @@ jobs:
         with:
           workspaces: consumer
           key: consumer-${{ matrix.consumer }}
-      # 只解析并编译依赖，不跑测试 —— 这里要回答的是「本仓的破坏性变更
-      # 会不会让下游编不过」，那才是下游 CI 失灵前唯一的预警。
+      # 只编译依赖，不跑测试 —— 这里要回答的是「本仓的破坏性变更会不会让下游
+      # 编不过」，那才是下游 CI 失灵前唯一的预警。
       - name: Cargo check downstream consumer
         working-directory: consumer
         run: cargo check --all-targets

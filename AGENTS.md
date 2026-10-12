@@ -70,6 +70,11 @@ crate，带运行时依赖（async-nats / tokio）；根包刻意**不**引入�
 `actions/checkout` 把下游仓与本仓放在同一 workspace 的兄弟目录
 （consumer 的 `path = "../cloud-core"` 正好解析到后者，**不需要软链**）。
 
+⚠️ **该 job 默认不执行**：agent-manager / workflow-manager 是私有仓，默认
+`GITHUB_TOKEN` 只对当前仓有效，跨仓 checkout 会报 `Repository not found`。
+job 上有 `if: ${{ secrets.CROSS_REPO_TOKEN != '' }}`，未配 secret 时整体跳过
+（不影响主线 CI 变红）。启用需配 secret `CROSS_REPO_TOKEN`（`contents: read`）。
+
 ## 构建、测试与开发命令
 
 - `cargo build` — 编译 crate；需要优化构建时加 `--release`。
