@@ -11,3 +11,13 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+
+# ⚠️ 本仓是 workspace 根，且**同时**是一个包（根包）。这样既能把
+# `cloud-core-queue` 收进同一仓、共享一次发布，又不破坏既有消费者 ——
+# 它们用 `path = "../cloud-core"` 或 `git = ...` 引用**根包**，路径与包名都不变。
+#
+# 根包刻意**不**引入 async-nats / tokio：tokengateway 仍是 WASM 组件，
+# 拖入运行时依赖会显著影响其体积与可移植性。需要队列运行时的服务
+# （agent-manager / workflow-manager / cloud-manager）依赖 `cloud-core-queue`。
+[workspace]
+members = ["cloud-core-queue"]

@@ -1,0 +1,45 @@
+[package]
+name = "cloud-core-queue"
+version = "0.1.0"
+edition = "2024"
+description = "面向原生服务的任务分发库（JetStream），cloud-manager / agent-manager / workflow-manager 共用"
+license = "Apache-2.0"
+
+[lib]
+name = "cloud_core_queue"
+path = "src/lib.rs"
+
+[dependencies]
+# ── 运行时 ──
+# async-nats：JetStream（stream / KV / durable consumer）。队列的唯一传输层。
+async-nats = { version = "0.49", default-features = false, features = [
+    # kv = ["jetstream"]，任务元数据存于 KV bucket，必须显式启用。
+    "jetstream",
+    "kv",
+] }
+# tokio：异步运行时。consumer 的 lease 续期 / 并发闸门 / 关停均基于它。
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# tokio-util：CancellationToken —— 关停信号与业务级取消的载体。
+tokio-util = { version = "0.7", features = ["rt"] }
+# futures：consumer 的消息流。
+futures = "0.3"
+# bytes：JetStream 收发用。
+bytes = "1"
+# tracing：日志。**不使用 println!/eprintln!**（库规范）。
+tracing = "0.1"
+# uuid：task id 用 v7（时间有序，便于 KV 与 stream 中排障）。
+uuid = { version = "1", features = ["v7"] }
+# async-trait：Worker / HeartbeatSink / CancellationSource 的异步 trait。
+async-trait = "0.1"
+# anyhow：错误上下文。
+anyhow = "1"
+
+# ── 序列化 ──
+# ⚠️ serde_json 只在本 crate **内部**用于信封/元数据/事件的编解码。
+# 对外 API 的签名里不出现 `serde_json::Value` —— 这是「禁止业务层操纵裸 JSON」
+# 这条约束的类型系统落点，详见 docs/cloud-core-queue-design.md §5.3。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "test-util"] }
