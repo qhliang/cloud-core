@@ -77,7 +77,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: taiki-e/install-action@cargo-machete@0.9
+      # ⚠️ 版本必须走 with.tool，不能写进 uses 的 ref：taiki-e/install-action
+      # 的 per-tool tag 只有 `cargo-machete`，不存在 `cargo-machete@0.9`。
+      # ref 写错时 GitHub 在**解析阶段**就判定 workflow 文件非法，整条流水线
+      # 一个 job 都不跑，页面上只显示 "This run likely failed because of a
+      # workflow file issue"。0.9.2 是本地验证过的版本。
+      - uses: taiki-e/install-action@cargo-machete
+        with:
+          tool: cargo-machete@0.9.2
       # --with-metadata：按 cargo metadata 解析依赖名，规避重命名依赖
       # （xml-rs → xml 之类）造成的误报。实测本仓 0 findings。
       #
