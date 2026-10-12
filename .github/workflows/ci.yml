@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Cargo fmt check
+        run: cargo +nightly fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # --workspace：根包与 cloud-core-queue 两个包都要过。
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # ⚠️ 只跑不需要 NATS 的测试。
+      #
+      # tests/integration.rs 与 tests/reliability.rs 需要一个**预置好资源**的
+      # JetStream（因为本库刻意不创建基础设施），未设 CCQ_NATS_URL 时它们
+      # 全部安静跳过 —— 所以这里 CI 能绿。
+      #
+      # ⚠️ 这是真实的覆盖缺口：端到端与 §9.2 可靠性回归**没有在 CI 里执行**。
+      # 它们靠本地手工跑：
+      #   nats-server -js -p 4222 -sd /tmp/ccq
+      #   nats kv add cloud-core-test-meta --history 1 --replicas 1
+      #   nats stream add cloud-core-test --subjects 'cloud-core-test.tasks.>' \
+      #     --retention workq --storage file --replicas 1
+      #   nats stream add cloud-core-test-results \
+      #     --subjects 'cloud-core-test.results.>' --retention limits --storage file --replicas 1
+      #   CCQ_NATS_URL=nats://127.0.0.1:4222 cargo test --workspace -- --test-threads=1
+      #
+      # 若要收进 CI，用 actions/service 的 nats 容器 + 上面几条预置命令即可。
+      - name: Cargo test
+        run: cargo test --workspace
+
+  # 根包必须保持 WASM 可编译。
+  #
+  # tokengateway 仍是 WASM 组件，依赖的是**根包**（不是 cloud-core-queue）。
+  # AGENTS.md 的硬约束是「根包不得引入 async-nats / tokio 等运行时依赖」——
+  # 一旦有人顺手往根包加一条，`cargo test` 全绿、WASM 消费者编译失败，
+  # 故障点远在另一个仓，很难往回溯。本 job 就是那道护栏。
+  wasm-root:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # 只编根包：cloud-core-queue 带 async-nats，本就不该进 WASM。
+      - name: Build root package for wasm32-wasip2
+        run: cargo build -p cloud-core --target wasm32-wasip2
+
+  # agent-manager / workflow-manager 从本仓 origin/main 拉取依赖。
+  # 本仓编译不过时，是**下游两个仓先炸**而本仓一声不响（它们只会在
+  # 解析依赖时报错）。本 job 让问题在这里先暴露。
+  consumers-resolve:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        consumer: [agent-manager, workflow-manager]
+    steps:
+      - name: Checkout consumer
+        uses: actions/checkout@v4
+        with:
+          repository: qhliang/${{ matrix.consumer }}
+          ref: main
+          path: consumer
+      # 无需软链：两个 checkout 分别落在 $GITHUB_WORKSPACE/{consumer,cloud-core}，
+      # 天然是兄弟目录 —— consumer 的 `path = "../cloud-core"` 正好解析到后者。
+      - name: Checkout cloud-core (simulated origin/main)
+        uses: actions/checkout@v4
+        with:
+          repository: qhliang/cloud-core
+          ref: main
+          path: cloud-core
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: consumer
+          key: consumer-${{ matrix.consumer }}
+      # 只解析并编译依赖，不跑测试 —— 这里要回答的是「本仓的破坏性变更
+      # 会不会让下游编不过」，那才是下游 CI 失灵前唯一的预警。
+      - name: Cargo check downstream consumer
+        working-directory: consumer
+        run: cargo check --all-targets

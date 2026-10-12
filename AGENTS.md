@@ -51,6 +51,25 @@ crate，带运行时依赖（async-nats / tokio）；根包刻意**不**引入�
 字段增删改名都会让它变红。线格式变更是破坏性变更，对应
 「先消费者、后生产者」的迁移顺序。
 
+## CI
+
+本仓有 `.github/workflows/ci.yml`，5 个 job：
+
+| job | 检查什么 |
+|---|---|
+| `fmt` / `clippy` / `test` | `--workspace`（根包 + cloud-core-queue） |
+| `wasm-root` | 根包编到 `wasm32-wasip2` —— 守护「根包不得引入运行时依赖」 |
+| `consumers-resolve` | agent-manager / workflow-manager 能否解析并编译本仓 `origin/main` |
+
+⚠️ **`test` job 不跑端到端**：`tests/integration.rs` 与 `tests/reliability.rs`
+需要一个预置好 stream/KV 的 JetStream，未设 `CCQ_NATS_URL` 时全部安静跳过。
+它们只能本地手工跑（命令见 ci.yml 里 `test` job 的注释）。
+
+⚠️ **`consumers-resolve` 是必要的**：下游两仓从本仓 `origin/main` 拉依赖，
+本仓编译不过时是**下游先炸**而本仓一声不响。该 job 用
+`actions/checkout` 把下游仓与本仓放在同一 workspace 的兄弟目录
+（consumer 的 `path = "../cloud-core"` 正好解析到后者，**不需要软链**）。
+
 ## 构建、测试与开发命令
 
 - `cargo build` — 编译 crate；需要优化构建时加 `--release`。
