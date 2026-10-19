@@ -150,7 +150,7 @@ pub struct CreateTaskRequest {
 /// 「一次任务下发」完全不同：没有 model / skills / mcps / 超时 / 内存上限，
 /// 却多了「属于哪一轮」这个定位信息。
 ///
-/// ## 存放位置与生命周期
+/// 存放位置与生命周期
 /// 存于 NATS KV `chat_followup.<chat_message_id>.<seq>`（每条一个键 ⇒ 生产者
 /// 只做纯写入，没有读-改-写竞态；这是与 `chat_stream.<mid>` 的关键区别）。
 /// agent-manager 消费后删除；轮次终态时 cloud-manager 前缀扫描清理残留。
@@ -158,6 +158,17 @@ pub struct CreateTaskRequest {
 /// ⚠️ **KV 没有 per-key TTL**（NATS `Allows Per-Message TTL: false`），
 /// 所以 `created_at_ms` 不是冗余字段：它是 cron 判定孤儿键的唯一依据。
 /// 没有它，进程崩溃留下的键会永远躺在 bucket 里。
+///
+/// ## 追问不再有 `chat_messages` 行
+///
+/// 0.6.9 之前每条追问都往 `chat_messages` 插一行 `role='user'`，UI 把它渲染成
+/// 普通发送气泡，同时 agent-manager 又往实时流推一条 `followup_notice` ⇒
+/// **同一句话渲染两遍**；且 `followup_notice` 只进实时流、不进归档 trace
+/// （见 agent-manager `task.rs` 的 `push_followup_notice` 旁注），所以轮次
+/// 终态后实时快照被归档替换，标记消失、只剩那个气泡。
+///
+/// 现在追问**只以 `followup_notice` 事件存在于所属 assistant 消息的 trace 里**，
+/// 实时流与归档同源 ⇒ 执行中与完成后表现一致，也不再需要 D1 行。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatFollowup {
     /// 所属轮次的 assistant 消息 id（= `CreateTaskRequest.chat_message_id`）。
@@ -166,9 +177,27 @@ pub struct ChatFollowup {
     /// dump 任意一个键就能读出「这条追问属于哪一轮」，不必去解析键名；
     /// 写路径也不必先查一次会话锁再拼键。
     pub chat_message_id: String,
-    /// 这条追问对应的 `chat_messages.id`（`role='user'` 行）。
-    pub user_message_id: String,
-    /// 对应的 `chat_messages.seq`，同时是 KV 键的排序后缀（决定投递顺序）。
+    /// 本条追问的稳定标识（`fu_<hex>`），cloud-manager 生成、随创建接口的响应
+    /// 返回给前端。
+    ///
+    /// ## 它解决什么
+    ///
+    /// 前端发追问后**不能**再插入乐观气泡（追问不再有 D1 行，气泡是唯一依据），
+    /// 但也不能让用户干等 —— agent-manager 最长要 `followup_poll_secs`（默认 5s）
+    /// 才投递。前端改为在正文流里显示一个**变暗的待发标记**，而真标记由
+    /// agent-manager 稍后写入 trace。
+    ///
+    /// ⚠️ 两者靠 `fid` 对齐：不能靠正文（用户可能连发两条相同内容），
+    /// 也不能靠顺序（待发标记可能因失败而被跳过）。缺了它，前端无法判断
+    /// 「哪个变暗块该被替换成真标记」。
+    #[serde(default)]
+    pub fid: String,
+    /// KV 键的排序后缀（决定投递顺序），同时写进 trace 事件便于排查。
+    ///
+    /// ⚠️ 它的来源**不能**是 `chat_messages` 的 `MAX(seq)`：追问已不再插行，
+    /// 那个最大值不会因追问而前进 ⇒ 同一轮连发多条会拿到**相同**的 seq ⇒
+    /// KV 键相同 ⇒ 后者覆盖前者 ⇒ 静默丢消息。cloud-manager 改为扫
+    /// `chat_followup.<mid>.*` 前缀取最大值 +1。
     pub seq: i64,
     /// 追问正文。附件另走 `file_refs`，正文里由 agent-manager 追加文件名提示。
     #[serde(default)]
@@ -722,7 +751,7 @@ mod chat_followup_tests {
     fn followup_round_trip() {
         let f = ChatFollowup {
             chat_message_id: "mid_xyz".into(),
-            user_message_id: "msg_abc".into(),
+            fid: "fu_abc".into(),
             seq: 7,
             content: "改成只回答 5".into(),
             file_refs: vec![TaskFileRef {
