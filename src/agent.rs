@@ -88,6 +88,26 @@ pub struct CreateTaskRequest {
     pub env: HashMap<String, String>,
     pub timeout_secs: u64,
     pub memory_limit_mb: u64,
+    // ── 项目记忆（memory bank）────────────────────────────────────────────
+    //
+    // ⚠️ **只影响 pi 的配置，不影响 `--tools`**。
+    //
+    // memory 系列工具（retain / recall / reflect / memory_edit / learn）在 pi 里
+    // 属于「不可由 `--tools` 选择」的一类：把它们写进 `--tools` 是 no-op（pi 只会
+    // 打一条警告）。真正的开关是 pi 配置里的 `memory.backend`：
+    //
+    //   · `off`（默认）⇒ 工具完全不注册；
+    //   · `local`     ⇒ 注册这 5 个工具（项目级 SQLite 记忆库）；
+    //   · `cass`      ⇒ 额外接只读的 CASS 会话归档检索。
+    //
+    // agent-manager 收到 `true` 时在**本任务的 agent-config** 里写
+    // `settings.json` 的 `{"memory":{"backend":"local"}}`。
+    //
+    // ⚠️ 与 `xdev` 的联动：memory 工具属于 Discoverable 层 ⇒ 一旦启用，
+    // pi 会自动把 `xdev` dispatcher 一并注册（这也是 agent-manager 不再显式
+    // 传 `xdev` 的原因 —— 显式传是无效的，只会每任务刷一条警告）。
+    /// 是否启用项目记忆（`memory.backend = "local"`）。
+    pub memory_enabled: bool,
     // ── 会话复用（session reuse）──────────────────────────────────────────
     //
     // ⚠️ `task_id` 依然是**执行记录 ID**（队列去重 + 状态/产物上报键），
@@ -673,6 +693,7 @@ mod session_field_compat_tests {
         let r: CreateTaskRequest = serde_json::from_str(json).unwrap();
         assert_eq!(r.task_id, "exec-1");
         assert!(!r.session_enabled, "缺省必须是「未启用」，不能默认开");
+        assert!(!r.memory_enabled, "缺省必须是「未启用」，不能默认开");
         assert!(r.session_dir_key.is_empty());
         assert!(r.session_hash.is_empty());
         assert!(r.session_blob_key.is_empty());
