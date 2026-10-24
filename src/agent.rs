@@ -160,7 +160,44 @@ pub struct CreateTaskRequest {
     /// 留空 = 不写 `user_message` 行（老 cloud-manager 下发的载荷仍可解析）。
     #[serde(default)]
     pub chat_user_message_id: String,
+
+    // ── 本轮执行参数（每轮可覆盖全局）──────────────────────────────────
+    //
+    // ⚠️ 全部是 `Option`：`None` = **不覆盖**，回退到 sync manifest 里的全局
+    // `AgentRuntimeConfig`。用 `bool`/`String` + 默认值不行 —— 那样「跟随全局」
+    // 与「显式关闭」分不开（全局开着时就没法单轮关掉）。
+    //
+    // ⚠️ 这些值由 **cloud-manager 解析并校验**（预设套餐在它那边），
+    // agent-manager 只负责“请求优先、缺省回退全局”，不判断套餐是否存在。
+    //
+    /// 计划模式（pi `--plan-mode`）：只读规划，直到计划被批准。
+    #[serde(default)]
+    pub plan_mode: Option<bool>,
+    /// 自动批准计划（pi `--plan-yolo`）：无人值守时自动批准提交的计划。
+    /// ⚠️ 无头模式没有审批界面，`plan_mode` 为真而它为假可能卡在「等待批准」。
+    #[serde(default)]
+    pub plan_yolo: Option<bool>,
+    /// 工具审批模式（pi `--approval-mode`）。
+    ///
+    /// ⚠️ 只允许 [`APPROVAL_MODES`]；`always-ask` 在无头执行下不可用
+    /// （会拒绝 bash/write/edit），cloud-manager 已不再提供该取值。
+    #[serde(default)]
+    pub approval_mode: Option<String>,
+    /// 扩展思考级别（pi `--thinking`）。只允许 [`THINKING_LEVELS`]。
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
+
+/// 工具审批模式的**合法取值**。
+///
+/// ⚠️ 刻意**不含** `always-ask`：本服务始终以无头模式运行（`-p --mode json` 或
+/// `--mode rpc`），没有审批提示界面 —— `always-ask` 下变更类工具（bash / write /
+/// edit）会被拒绝，pi v0.5.x 还会以退出码 3 显式失败。cloud-manager 在解析
+/// 每轮参数时也用它做校验。
+pub const APPROVAL_MODES: &[&str] = &["write", "yolo"];
+
+/// 扩展思考级别的**合法取值**（与 pi `--thinking` 一致）。
+pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// 在线对话的**追问**：本轮执行**进行中**追加的一条用户消息。
 ///
@@ -718,6 +755,56 @@ mod session_field_compat_tests {
         assert_eq!(back.session_dir_key, "tk_abc123");
         assert_eq!(back.session_hash, "sha256hex");
         assert_eq!(back.session_blob_key, "agent-session/tk_abc123");
+    }
+
+    /// ⚠️ **每轮执行参数的兼容性**：新字段全部是 `Option`，老 payload（没有它们）
+    /// 必须解析成 `None` = 「不覆盖，跟随全局」。
+    ///
+    /// 两个方向的窗口都要能跑：`新 cloud-manager → 老 agent-manager`（老 worker
+    /// 忽略未知字段）与 `老 cloud-manager → 新 agent-manager`（这里）。
+    #[test]
+    fn old_payload_without_run_params_keeps_parsing() {
+        let json = r#"{"task_id":"exec-1","prompt":"hi"}"#;
+        let r: CreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.plan_mode, None);
+        assert_eq!(r.plan_yolo, None);
+        assert_eq!(r.approval_mode, None);
+        assert_eq!(r.thinking, None);
+    }
+
+    /// 四个参数齐全时正常 round-trip —— 防止有人手滑把 `#[serde(default)]` 弄丢。
+    #[test]
+    fn run_params_round_trip() {
+        let r = CreateTaskRequest {
+            task_id: "exec-1".into(),
+            prompt: "p".into(),
+            plan_mode: Some(true),
+            plan_yolo: Some(true),
+            approval_mode: Some("write".into()),
+            thinking: Some("high".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: CreateTaskRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.plan_mode, Some(true));
+        assert_eq!(back.plan_yolo, Some(true));
+        assert_eq!(back.approval_mode.as_deref(), Some("write"));
+        assert_eq!(back.thinking.as_deref(), Some("high"));
+    }
+
+    /// 合法取值清单：`always-ask` **必须不在**审批模式里（无头执行不可用），
+    /// 思考级别必须与 pi `--thinking` 的 7 档一致。
+    #[test]
+    fn run_param_allow_lists_are_correct() {
+        assert_eq!(APPROVAL_MODES, &["write", "yolo"]);
+        assert!(
+            !APPROVAL_MODES.contains(&"always-ask"),
+            "always-ask 在无头执行下不可用，不能出现在允许清单里"
+        );
+        assert_eq!(
+            THINKING_LEVELS,
+            &["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
     }
 
     /// ⚠️ 老 cloud-manager 不下发 `chat_user_message_id` ⇒ 必须降级为
