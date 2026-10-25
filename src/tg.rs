@@ -49,6 +49,80 @@ pub enum ProviderAuth {
     None,
 }
 
+/// 服务商下的一个**具体模型**，可带若干标签。
+///
+/// ⚠️ 标签是**自由字符串**（用户自定义），由管理端做去重/trim；
+/// 服务商组可以「按 tag」动态关联成员（见 [`GroupMembers`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModel {
+    pub name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// `Provider.models` 的兼容反序列化：同时接受
+/// - 新形态 `[{"name":"gpt-4","tags":["cheap"]}]`
+/// - 旧形态 `["gpt-4"]`（label 为空）
+///
+/// ⚠️ **兼容层是为了部署顺序**：tokengateway 与 cloud-manager 分别发版，
+/// 过渡期一方可能还在读旧形状的同步清单。等两侧都升级后可以删掉。
+fn models_compat<'de, D>(d: D) -> Result<Vec<ProviderModel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        New(Vec<ProviderModel>),
+        Legacy(Vec<String>),
+    }
+    Ok(match Raw::deserialize(d)? {
+        Raw::New(v) => v,
+        Raw::Legacy(v) => v
+            .into_iter()
+            .map(|name| ProviderModel {
+                name,
+                tags: Vec::new(),
+            })
+            .collect(),
+    })
+}
+
+impl ProviderModel {
+    /// 从 `tg_providers.models` 列的 JSON 文本解析模型清单。
+    ///
+    /// ⚠️ **兼容旧形状** `["gpt-4"]`（无 tag）：管理端读到旧数据不会报错，
+    /// 用户下次保存时会写成新形状。解析失败 / 空串 ⇒ 空清单（候选数据，不报错）。
+    pub fn parse_list(raw: &str) -> Vec<ProviderModel> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            New(Vec<ProviderModel>),
+            Legacy(Vec<String>),
+        }
+        match serde_json::from_str::<Raw>(raw) {
+            Ok(Raw::New(v)) => v,
+            Ok(Raw::Legacy(v)) => v
+                .into_iter()
+                .map(|name| ProviderModel {
+                    name,
+                    tags: Vec::new(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 该模型是否带任一指定 tag（按 tag 关联服务商组时用）。
+    pub fn has_any_tag(&self, tags: &[String]) -> bool {
+        self.tags.iter().any(|t| tags.contains(t))
+    }
+}
+
 /// A single upstream LLM provider。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -58,8 +132,12 @@ pub struct Provider {
     pub provider_type: String,
     pub auth: ProviderAuth,
     pub tier: Tier,
-    #[serde(default)]
-    pub models: Vec<String>,
+    /// 该服务商可用的**具体模型**（含标签）。
+    ///
+    /// ⚠️ 路由与「按 tag 关联的服务商组」都从这里取模型 ——
+    /// 它是**选路的唯一模型来源**，不允许路由凭空写一个模型名。
+    #[serde(default, deserialize_with = "models_compat")]
+    pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default = "default_true")]
@@ -109,16 +187,42 @@ pub enum ActiveWindow {
     },
 }
 
-/// Serialize Vec<Option<String>> as Vec<String> (None -> "") so TOML can represent it。
-fn serialize_fallback_rewrite_models<S: serde::Serializer>(
-    val: &[Option<String>],
-    ser: S,
-) -> Result<S::Ok, S::Error> {
-    let mapped: Vec<&str> = val.iter().map(|m| m.as_deref().unwrap_or("")).collect();
-    mapped.serialize(ser)
+/// 一个具体的上游端点：**服务商 + 模型**。
+///
+/// ⚠️ 模型必须是该服务商 `models` 里配置过的名字（保存期校验）——
+/// 这是「路由不再允许显式模型覆盖」的落点：上游收到的模型恒由目标决定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub provider: String,
+    pub model: String,
 }
 
-/// An explicit model → provider route。
+/// 路由的目标：一个具体端点，或一个服务商组。
+///
+/// ⚠️ 用**内部标签**（`kind`）而不是 `Option<provider>` + `Option<group>`：
+/// 让「二者必居其一」由类型保证，序列化后也自解释。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RouteTarget {
+    /// 直连某个服务商的某个模型。
+    Provider { provider: String, model: String },
+    /// 交给服务商组选成员（成员各自的模型由组决定）。
+    Group { group: String },
+}
+
+impl RouteTarget {
+    /// 目标是「空的」——旧数据缺字段时的兜底，运行时跳过并告警。
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Provider { provider, model } => {
+                provider.trim().is_empty() || model.trim().is_empty()
+            }
+            Self::Group { group } => group.trim().is_empty(),
+        }
+    }
+}
+
+/// An explicit model → target route。
 #[derive(Debug, Clone, Serialize)]
 pub struct Route {
     #[serde(default)]
@@ -131,13 +235,11 @@ pub struct Route {
     pub rules: Vec<PatternRule>,
     #[serde(default)]
     pub users: Vec<String>,
-    pub provider: String,
+    /// 主目标（服务商+模型 或 服务商组）。
+    pub target: RouteTarget,
+    /// 备用目标（按顺序尝试）。空模型/空组的目标会被运行时跳过。
     #[serde(default)]
-    pub fallback_providers: Vec<String>,
-    #[serde(default)]
-    pub rewrite_model: Option<String>,
-    #[serde(default, serialize_with = "serialize_fallback_rewrite_models")]
-    pub fallback_rewrite_models: Vec<Option<String>>,
+    pub fallbacks: Vec<RouteTarget>,
     #[serde(default)]
     pub supports_thinking: bool,
     #[serde(default = "default_true")]
@@ -164,7 +266,14 @@ impl<'de> serde::Deserialize<'de> for Route {
             rules: Vec<PatternRule>,
             #[serde(default)]
             users: Vec<String>,
-            provider: String,
+            // 新形态
+            #[serde(default)]
+            target: Option<RouteTarget>,
+            #[serde(default)]
+            fallbacks: Vec<RouteTarget>,
+            // ── 旧形态（兼容过渡期，见模块文档）──
+            #[serde(default)]
+            provider: Option<String>,
             #[serde(default)]
             fallback_providers: Vec<String>,
             #[serde(default)]
@@ -190,16 +299,40 @@ impl<'de> serde::Deserialize<'de> for Route {
         } else {
             vec![]
         };
+        // ⚠️ **兼容旧清单**：旧形态是「provider + 可选 rewrite_model」。
+        //    有 rewrite_model ⇒ 它就是目标模型；没有 ⇒ 目标模型留空
+        //    （运行时跳过该目标并告警，不静默改发客户端请求的模型）。
+        let target = match raw.target {
+            Some(t) => t,
+            None => RouteTarget::Provider {
+                provider: raw.provider.unwrap_or_default(),
+                model: raw.rewrite_model.unwrap_or_default(),
+            },
+        };
+        let fallbacks = if !raw.fallbacks.is_empty() {
+            raw.fallbacks
+        } else {
+            raw.fallback_providers
+                .iter()
+                .enumerate()
+                .map(|(i, p)| RouteTarget::Provider {
+                    provider: p.clone(),
+                    model: raw
+                        .fallback_rewrite_models
+                        .get(i)
+                        .and_then(|m| m.clone())
+                        .unwrap_or_default(),
+                })
+                .collect()
+        };
         Ok(Route {
             id: raw.id,
             name: raw.name,
             note: raw.note,
             rules,
             users: raw.users,
-            provider: raw.provider,
-            fallback_providers: raw.fallback_providers,
-            rewrite_model: raw.rewrite_model,
-            fallback_rewrite_models: raw.fallback_rewrite_models,
+            target,
+            fallbacks,
             supports_thinking: raw.supports_thinking,
             enabled: raw.enabled,
             active_window: raw.active_window,
@@ -232,15 +365,67 @@ impl std::fmt::Display for GroupStrategy {
     }
 }
 
+/// 服务商组的成员来源。**两种模式互斥**（由类型保证，不是靠校验）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GroupMembers {
+    /// 显式列出 `(服务商, 模型)`。
+    ProviderModels { items: Vec<ModelRef> },
+    /// 按标签动态关联：成员 = 所有「模型带任一 tag」的 `(服务商, 模型)`。
+    ///
+    /// ⚠️ 动态成员意味着「给某个模型加 tag 后自动进组」——这正是 tag 的用途；
+    /// 代价是组内成员会随服务商配置变化，管理端要展示「当前匹配 N 个」。
+    Tags { tags: Vec<String> },
+}
+
 /// A virtual provider that aggregates one or more real providers。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProviderGroup {
     pub name: String,
-    pub providers: Vec<String>,
+    /// 成员来源（显式列表 或 按 tag）。
+    pub members: GroupMembers,
     #[serde(default)]
     pub strategy: GroupStrategy,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for ProviderGroup {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct GroupRaw {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            members: Option<GroupMembers>,
+            // 旧形态：只有服务商名（没有模型）
+            #[serde(default)]
+            providers: Vec<String>,
+            #[serde(default)]
+            strategy: GroupStrategy,
+            #[serde(default = "default_true")]
+            enabled: bool,
+        }
+        let raw = GroupRaw::deserialize(d)?;
+        // ⚠️ 旧形态的服务商没有模型名 ⇒ 展开成空模型，运行时跳过并告警
+        //    （用户需要手工重新配置 —— 不做数据迁移是既定决策）。
+        let members = raw.members.unwrap_or_else(|| GroupMembers::ProviderModels {
+            items: raw
+                .providers
+                .into_iter()
+                .map(|provider| ModelRef {
+                    provider,
+                    model: String::new(),
+                })
+                .collect(),
+        });
+        Ok(ProviderGroup {
+            name: raw.name,
+            members,
+            strategy: raw.strategy,
+            enabled: raw.enabled,
+        })
+    }
 }
 
 // ── Auth ──────────────────────────────────────────────────
@@ -323,4 +508,156 @@ pub struct CallRecord {
 
 fn default_attempt_role() -> String {
     "primary".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ **兼容层是部署顺序的安全带**：tokengateway 与 cloud-manager 分别发版，
+    /// 过渡期可能读到旧形状的同步清单。旧形状必须能解析，且语义不能跑偏。
+    #[test]
+    fn provider_models_accepts_legacy_string_array() {
+        let p: Provider = serde_json::from_value(serde_json::json!({
+            "name": "p1", "base_url": "http://x/v1", "type": "openai",
+            "auth": {"kind": "none"}, "tier": "paid",
+            "models": ["gpt-4", "gpt-4o"]
+        }))
+        .unwrap();
+        assert_eq!(p.models.len(), 2);
+        assert_eq!(p.models[0].name, "gpt-4");
+        assert!(p.models[0].tags.is_empty(), "旧形态没有 tag");
+    }
+
+    #[test]
+    fn provider_models_accepts_new_shape_with_tags() {
+        let p: Provider = serde_json::from_value(serde_json::json!({
+            "name": "p1", "base_url": "http://x/v1", "type": "openai",
+            "auth": {"kind": "none"}, "tier": "paid",
+            "models": [{"name": "gpt-4", "tags": ["cheap", "fast"]}]
+        }))
+        .unwrap();
+        assert_eq!(
+            p.models[0].tags,
+            vec!["cheap".to_string(), "fast".to_string()]
+        );
+    }
+
+    /// 旧路由（provider + rewrite_model）⇒ 目标是 (服务商, rewrite_model)。
+    /// 没有 rewrite_model ⇒ 模型留空（运行时跳过，**不**静默透传客户端模型）。
+    #[test]
+    fn route_accepts_legacy_provider_and_rewrite_model() {
+        let r: Route = serde_json::from_value(serde_json::json!({
+            "id": "r1", "provider": "openrouter-free", "rewrite_model": "openrouter/free",
+            "rules": [{"pattern": "agent-manager-model", "match_type": "exact"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            r.target,
+            RouteTarget::Provider {
+                provider: "openrouter-free".into(),
+                model: "openrouter/free".into()
+            }
+        );
+        assert!(r.fallbacks.is_empty());
+
+        let no_rewrite: Route = serde_json::from_value(serde_json::json!({
+            "id": "r2", "provider": "p1"
+        }))
+        .unwrap();
+        assert_eq!(
+            no_rewrite.target,
+            RouteTarget::Provider {
+                provider: "p1".into(),
+                model: String::new()
+            }
+        );
+        assert!(no_rewrite.target.is_empty(), "空模型的目标应被视为无效");
+    }
+
+    /// 旧 fallback（服务商列表 + 逐项 rewrite）⇒ `Vec<RouteTarget>`。
+    #[test]
+    fn route_accepts_legacy_fallbacks() {
+        let r: Route = serde_json::from_value(serde_json::json!({
+            "id": "r1", "provider": "p1", "rewrite_model": "m1",
+            "fallback_providers": ["p2", "p3"],
+            "fallback_rewrite_models": ["m2", ""]
+        }))
+        .unwrap();
+        assert_eq!(
+            r.fallbacks,
+            vec![
+                RouteTarget::Provider {
+                    provider: "p2".into(),
+                    model: "m2".into()
+                },
+                RouteTarget::Provider {
+                    provider: "p3".into(),
+                    model: String::new()
+                },
+            ]
+        );
+    }
+
+    /// 新路由目标的原生形态（含 fallback 指向组）。
+    #[test]
+    fn route_accepts_native_targets() {
+        let r: Route = serde_json::from_value(serde_json::json!({
+            "id": "r1",
+            "target": {"kind": "group", "group": "fast"},
+            "fallbacks": [{"kind": "provider", "provider": "p1", "model": "m1"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            r.target,
+            RouteTarget::Group {
+                group: "fast".into()
+            }
+        );
+        assert_eq!(
+            r.fallbacks,
+            vec![RouteTarget::Provider {
+                provider: "p1".into(),
+                model: "m1".into()
+            }]
+        );
+    }
+
+    /// 旧组（providers: ["p"]）⇒ 显式成员，模型为空（需人工重新配置）。
+    #[test]
+    fn group_accepts_legacy_provider_list() {
+        let g: ProviderGroup = serde_json::from_value(serde_json::json!({
+            "name": "g1", "providers": ["deepseek"], "strategy": "load_balance"
+        }))
+        .unwrap();
+        match g.members {
+            GroupMembers::ProviderModels { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].provider, "deepseek");
+                assert!(items[0].model.is_empty(), "旧组成员没有模型");
+            }
+            _ => panic!("旧形态应映射为显式成员"),
+        }
+    }
+
+    /// 组的两种模式必须能正确序列化/反序列化（tagged union）。
+    #[test]
+    fn group_members_tagged_union_roundtrip() {
+        let tags = GroupMembers::Tags {
+            tags: vec!["cheap".into()],
+        };
+        let json = serde_json::to_value(&tags).unwrap();
+        assert_eq!(json["kind"], "tags");
+        assert_eq!(serde_json::from_value::<GroupMembers>(json).unwrap(), tags);
+
+        let items = GroupMembers::ProviderModels {
+            items: vec![ModelRef {
+                provider: "p".into(),
+                model: "m".into(),
+            }],
+        };
+        let json = serde_json::to_value(&items).unwrap();
+        assert_eq!(json["kind"], "provider_models");
+        assert_eq!(serde_json::from_value::<GroupMembers>(json).unwrap(), items);
+    }
 }
