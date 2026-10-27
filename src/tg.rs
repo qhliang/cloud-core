@@ -140,6 +140,13 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub proxy: Option<String>,
+    /// 可选：覆盖发往上游的 `user-agent`。`None` / 空 ⇒ **透传调用方**的值。
+    ///
+    /// ⚠️ 与上面那个恒为 `None` 的 `proxy` 不同，本字段是活配置：
+    ///    cloud-manager 写入、tokengateway 在 `upstream_headers()` 里消费。
+    ///    未配置时保持既有行为（调用方 UA 原样透传），不补网关默认值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -513,6 +520,33 @@ fn default_attempt_role() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `user_agent` 是**新增的可选字段**：旧清单（完全没有这个键）必须照样能读，
+    /// 语义是 `None`（透传调用方 UA）；写了值则原样带出。
+    ///
+    /// ⚠️ 这条是部署顺序的安全带：cloud-manager 与 tokengateway 分开发版，
+    ///    过渡期两边读到的清单可能是对方旧版本写的。
+    #[test]
+    fn provider_user_agent_is_optional_and_round_trips() {
+        let legacy: Provider = serde_json::from_value(serde_json::json!({
+            "name": "p1", "base_url": "http://x/v1", "type": "openai",
+            "auth": {"kind": "none"}, "tier": "paid", "models": []
+        }))
+        .expect("旧清单（无 user_agent）必须能解析");
+        assert_eq!(legacy.user_agent, None);
+
+        let with_ua: Provider = serde_json::from_value(serde_json::json!({
+            "name": "p1", "base_url": "http://x/v1", "type": "openai",
+            "auth": {"kind": "none"}, "tier": "paid", "models": [],
+            "user_agent": "curl/8.5.0"
+        }))
+        .expect("带 user_agent 的清单必须能解析");
+        assert_eq!(with_ua.user_agent.as_deref(), Some("curl/8.5.0"));
+
+        // 未配置时不往清单里写 `"user_agent": null`（旧网关也不认识这个键）。
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("user_agent").is_none());
+    }
 
     /// ⚠️ **兼容层是部署顺序的安全带**：tokengateway 与 cloud-manager 分别发版，
     /// 过渡期可能读到旧形状的同步清单。旧形状必须能解析，且语义不能跑偏。
