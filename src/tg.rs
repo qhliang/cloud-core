@@ -235,6 +235,19 @@ pub fn resolve_header_refs(value: &str, original: &[(String, String)]) -> String
     out
 }
 
+/// 合法的 HTTP 请求头名：RFC 7230 token，长度 ≤ 64。
+///
+/// 两处共用，避免「管理端放行、运行端拒绝」的漂移：
+/// - cloud-manager 保存智能体/服务商配置时校验；
+/// - agent-manager 写 `models.json` 的 `headers` 前再做一次兜底。
+pub fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+}
+
 /// 解析单个 `头名[:起-止]`；`None` = 不像引用，调用方原样保留。
 fn resolve_one(expr: &str, original: &[(String, String)]) -> Option<String> {
     let (name, range) = match expr.split_once(':') {
@@ -776,6 +789,22 @@ mod tests {
             resolve_header_refs("{cookie:-100}", &original),
             "session=abcdef"
         );
+    }
+
+    /// 头名合法性：正常头名通过，空格/冒号/中文/超长拒绝（两端共用同一判据）。
+    #[test]
+    fn header_name_token_rule_is_shared() {
+        for ok in [
+            "x-session-affinity",
+            "session_id",
+            "Authorization",
+            "a!#$%&'*+-.^_`|~",
+        ] {
+            assert!(is_valid_header_name(ok), "{ok} 应合法");
+        }
+        for bad in ["", "bad name", "x:y", "会话", &"a".repeat(65)] {
+            assert!(!is_valid_header_name(bad), "{bad:?} 应拒绝");
+        }
     }
 
     /// 不是引用的花括号必须**原样保留**（避免把 JSON 字面量吃掉），

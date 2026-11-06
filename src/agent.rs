@@ -391,6 +391,17 @@ pub struct AgentRuntimeConfig {
     /// 追加到系统提示词（文本内容）。
     #[serde(default)]
     pub append_system_prompt: String,
+    /// 需要注入到 pi **出站大模型请求**里的会话亲和请求头名（值 = 会话 id）。
+    ///
+    /// 用途：Fireworks 等按「会话 → 副本」做 prompt cache 路由的后端，要求同一
+    /// 会话的请求固定落在同一副本；pi-mono 用 `compat.sendSessionAffinityHeaders`
+    /// 发 `x-session-affinity` / `session_id` / `x-client-request-id`。
+    /// pi_agent_rust v0.8.0 没有这个开关，但它支持 `models.json` 的 provider
+    /// `headers`，所以由 agent-manager 把这些头写进每个任务的配置。
+    ///
+    /// 空列表 = 不注入；头名可自定义、可多个（大小写无关，但按用户写法下发）。
+    #[serde(default = "default_session_affinity_headers")]
+    pub session_affinity_headers: Vec<String>,
     /// cloud-manager 的内部基地址，形如 `http://cloud-manager.wasmcloud.svc:80`。
     /// agent-manager 用它拉取任务初始文件（`GET /internal/agent-task-files`）。
     #[serde(default)]
@@ -430,9 +441,20 @@ impl Default for AgentRuntimeConfig {
             thinking: "medium".to_string(),
             system_prompt: String::new(),
             append_system_prompt: String::new(),
+            session_affinity_headers: default_session_affinity_headers(),
             cloud_manager_url: String::new(),
         }
     }
+}
+
+/// 默认的会话亲和请求头：与 pi-mono 的 `compat.sendSessionAffinityHeaders`
+/// 默认发送的组合对齐。
+///
+/// ⚠️ 这两个头是**同义冗余**：不同后端认不同的名字（Fireworks 认
+/// `x-session-affinity`，部分 OpenAI 兼容网关认 `session_id`）。同时发两个
+/// 比让用户猜哪一个有效更省事 —— 多一个头对不识别的后端是无害的。
+pub fn default_session_affinity_headers() -> Vec<String> {
+    vec!["x-session-affinity".to_string(), "session_id".to_string()]
 }
 
 /// Sync manifest 中的 skill 条目。
@@ -951,5 +973,51 @@ mod chat_followup_tests {
         );
         // 反向也要成立：id 是变长的，前缀匹配不能只比开头几个字符。
         assert!(!chat_followup_kv_key("mid_aa", 0).starts_with(&mine));
+    }
+}
+
+#[cfg(test)]
+mod runtime_config_session_affinity_tests {
+    use super::*;
+
+    /// 默认值必须与 pi-mono 的 `compat.sendSessionAffinityHeaders` 对齐，
+    /// 否则「什么都不配」时线上仍然不发头，用户会以为功能没生效。
+    #[test]
+    fn session_affinity_headers_default_to_pi_mono_pair() {
+        let cfg = AgentRuntimeConfig::default();
+        assert_eq!(
+            cfg.session_affinity_headers,
+            vec!["x-session-affinity".to_string(), "session_id".to_string()]
+        );
+    }
+
+    /// 老 manifest（没有这个键）⇒ 用默认值而不是空列表。
+    ///
+    /// ⚠️ 方向是刻意选的：功能默认开启，老 cloud-manager 下发的 manifest 也能
+    /// 立刻让新 agent-manager 生效；用户想关掉时显式发空数组。
+    #[test]
+    fn missing_field_uses_default_not_empty() {
+        let cfg: AgentRuntimeConfig = serde_json::from_str(r#"{"llm_url":"http://x"}"#).unwrap();
+        assert_eq!(cfg.session_affinity_headers.len(), 2);
+    }
+
+    /// 显式空数组 = 关闭；自定义头名原样保留（大小写与顺序都不动）。
+    #[test]
+    fn explicit_values_are_preserved_including_empty() {
+        let off: AgentRuntimeConfig =
+            serde_json::from_str(r#"{"session_affinity_headers":[]}"#).unwrap();
+        assert!(off.session_affinity_headers.is_empty());
+
+        let custom: AgentRuntimeConfig = serde_json::from_str(
+            r#"{"session_affinity_headers":["X-My-Session","x-client-request-id"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            custom.session_affinity_headers,
+            vec![
+                "X-My-Session".to_string(),
+                "x-client-request-id".to_string()
+            ]
+        );
     }
 }
