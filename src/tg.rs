@@ -123,6 +123,171 @@ impl ProviderModel {
     }
 }
 
+/// 一条「新增请求头」配置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderPair {
+    /// 请求头名（写进上游时的大小写以此为准）。
+    pub name: String,
+    /// 值：**字面量**，或混入 `{头名:起-止}` 引用调用方**原始请求头**（大小写无关）。
+    ///
+    /// 例：
+    /// - `xxx_{cookie:2-}` —— `cookie` 头从第 2 个字符到末尾；
+    /// - `{authorization}` —— 整个 `authorization` 头；
+    /// - `Bearer {x-token:0-8}` —— 取前 8 个字符；
+    /// - `static-value` —— 纯字面量。
+    pub value: String,
+}
+
+/// 发往上游前的请求头增删配置。
+///
+/// ## 执行顺序：**先新增、后删除**
+///
+/// 这是刻意的 —— 否则「引用一个马上要被删掉的头」会取不到值：
+/// 新增阶段先按引用把值**拷贝**出来，删除阶段再把这个原头摘掉，
+/// 两条规则就能同时生效。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderConfig {
+    /// 新增 / 覆盖（同名头会被替换，保留一份）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add: Vec<HeaderPair>,
+    /// 删除（**大小写无关**，只写名字）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+}
+
+impl HeaderConfig {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
+
+    /// 把配置应用到一组「待发往上游」的请求头上。
+    ///
+    /// `original` 是调用方**原始**请求头（协议转换前的那份），供
+    /// `${header.<名>}` 取值；它的值不会被本次增删影响。
+    ///
+    /// ⚠️ 只做增删，不负责合法性 —— 名字/值的校验在写入端（cloud-manager）
+    /// 完成，放到这里会让「测试探测」这类没有原始头的场景也被拒。
+    pub fn apply(&self, headers: &mut Vec<(String, String)>, original: &[(String, String)]) {
+        for pair in &self.add {
+            let name = pair.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let value = resolve_header_refs(&pair.value, original);
+            // 同名头**覆盖**而不是追加：HTTP 单值头重复会让上游判非法。
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            headers.push((name.to_string(), value));
+        }
+        if self.remove.iter().any(|r| !r.trim().is_empty()) {
+            headers.retain(|(k, _)| {
+                !self
+                    .remove
+                    .iter()
+                    .any(|r| !r.trim().is_empty() && r.trim().eq_ignore_ascii_case(k))
+            });
+        }
+    }
+}
+
+/// 把 `value` 里的 `{头名:起-止}` 替换成 `original` 中同名头的**切片**。
+///
+/// ## 语法
+///
+/// | 写法 | 含义 |
+/// |---|---|
+/// | `{cookie}` | 整个 `cookie` 头 |
+/// | `{cookie:2-}` | 从第 2 个字符到末尾 |
+/// | `{cookie:2-5}` | `[2, 5)`（左闭右开） |
+/// | `{cookie:-5}` | 前 5 个字符（`[0, 5)`） |
+/// | `{cookie:3}` | 只取第 3 个字符 |
+/// | `xxx_{cookie:2-}` | 与字面量混用：得到 `xxx_` + 切片 |
+///
+/// ## 规则
+///
+/// - 头名**大小写无关**；
+/// - 下标按**字符**（不是字节）算，越界自动收敛到合法区间（不 panic）；
+/// - 头不存在 ⇒ 空串（不能把 `{cookie:2-}` 这种占位符原样发给上游）；
+/// - `{...}` 里不像引用时（空、名字含非法字符、括号没闭合）**原样保留**，
+///   这样 `{"a":1}` 这类字面量不会被误吃。
+pub fn resolve_header_refs(value: &str, original: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            // 没有闭合 ⇒ 剩余部分原样保留。
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let expr = &after[..end];
+        match resolve_one(expr, original) {
+            Some(v) => out.push_str(&v),
+            None => {
+                out.push('{');
+                out.push_str(expr);
+                out.push('}');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 解析单个 `头名[:起-止]`；`None` = 不像引用，调用方原样保留。
+fn resolve_one(expr: &str, original: &[(String, String)]) -> Option<String> {
+    let (name, range) = match expr.split_once(':') {
+        Some((n, r)) => (n.trim(), Some(r.trim())),
+        None => (expr.trim(), None),
+    };
+    // 头名必须是合法 token —— 顺便把 `{"a":1}` 这种字面量排除掉。
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+    {
+        return None;
+    }
+    // ⚠️ 先把区间语法解析干净，**再**去查头：否则 `{cookie:b}` 这种语法错误
+    //    会因为「头不存在」被解析成空串，而不是原样保留。
+    let (start, end) = match range {
+        None => (0, None),
+        // `{h:}` 等价于整值（用户清空了区间输入框）。
+        Some("") => (0, None),
+        Some(r) => match r.split_once('-') {
+            Some((a, b)) => {
+                let start = if a.trim().is_empty() {
+                    0
+                } else {
+                    a.trim().parse::<usize>().ok()?
+                };
+                let end = if b.trim().is_empty() {
+                    None
+                } else {
+                    Some(b.trim().parse::<usize>().ok()?)
+                };
+                (start, end)
+            }
+            // 没有 `-`：当成单字符下标。
+            None => {
+                let i = r.parse::<usize>().ok()?;
+                (i, Some(i.saturating_add(1)))
+            }
+        },
+    };
+    let Some((_, raw)) = original.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) else {
+        // 头不存在：引用结果为空串。
+        return Some(String::new());
+    };
+    let chars: Vec<char> = raw.chars().collect();
+    let len = chars.len();
+    let start = start.min(len);
+    // 越界 / 起止颠倒都收敛成空区间，不 panic。
+    let end = end.unwrap_or(len).min(len).max(start);
+    Some(chars[start..end].iter().collect())
+}
+
 /// A single upstream LLM provider。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -147,6 +312,13 @@ pub struct Provider {
     ///    未配置时保持既有行为（调用方 UA 原样透传），不补网关默认值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// 发往上游前的请求头增删（先新增、后删除）。
+    ///
+    /// ⚠️ 与 `user_agent` 不同，这里是**批量**规则：`add` 可以覆盖任意头
+    /// （含 `authorization`），`remove` 按名字丢弃（大小写无关）。
+    /// 留空 ⇔ 完全不干预，行为与升级前一致。
+    #[serde(default, skip_serializing_if = "HeaderConfig::is_empty")]
+    pub headers: HeaderConfig,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -520,6 +692,119 @@ fn default_attempt_role() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 请求头配置的执行顺序：**先新增、后删除**。
+    ///
+    /// 这是需求里点名的行为：`add` 里引用了一个「同时被 `remove` 掉的原始头」，
+    /// 也必须能取到值 —— 因为新增阶段先把它拷出来，删除阶段删的是**原头**。
+    #[test]
+    fn header_config_adds_before_removing() {
+        let cfg = HeaderConfig {
+            add: vec![HeaderPair {
+                name: "x-copied".into(),
+                value: "prefix_{X-Source:2-}".into(),
+            }],
+            remove: vec!["x-source".into()],
+        };
+        let original = vec![("X-Source".to_string(), "01value".to_string())];
+        let mut headers = vec![
+            ("x-source".to_string(), "01value".to_string()),
+            ("accept".to_string(), "*/*".to_string()),
+        ];
+        cfg.apply(&mut headers, &original);
+        assert_eq!(
+            headers,
+            vec![
+                ("accept".to_string(), "*/*".to_string()),
+                // 新增的头取到了切片（跳过前 2 个字符）……
+                ("x-copied".to_string(), "prefix_value".to_string()),
+                // ……而原头最后被删掉。
+            ]
+        );
+    }
+
+    /// 删除是**大小写无关**的，新增则覆盖同名头（只留一份）。
+    #[test]
+    fn header_config_is_case_insensitive() {
+        let cfg = HeaderConfig {
+            add: vec![HeaderPair {
+                name: "Authorization".into(),
+                value: "Bearer x".into(),
+            }],
+            remove: vec!["ACCEPT".into(), "x-gone".into()],
+        };
+        let mut headers = vec![
+            ("authorization".to_string(), "Bearer old".to_string()),
+            ("accept".to_string(), "*/*".to_string()),
+            ("X-Gone".to_string(), "1".to_string()),
+            ("x-keep".to_string(), "2".to_string()),
+        ];
+        cfg.apply(&mut headers, &[]);
+        assert_eq!(
+            headers,
+            vec![
+                ("x-keep".to_string(), "2".to_string()),
+                ("Authorization".to_string(), "Bearer x".to_string()),
+            ]
+        );
+    }
+
+    /// 引用语法 `{头名:起-止}`：大小写无关、可混在字面量里、按字符切片。
+    #[test]
+    fn header_refs_slice_by_char_index() {
+        let original = vec![
+            ("cookie".to_string(), "session=abcdef".to_string()),
+            ("user-agent".to_string(), "curl/8.5.0".to_string()),
+        ];
+        // 需求里的例子：从第 2 个字符到末尾。
+        assert_eq!(
+            resolve_header_refs("xxx_{cookie:2-}", &original),
+            "xxx_ssion=abcdef"
+        );
+        // 整个头。
+        assert_eq!(resolve_header_refs("{Cookie}", &original), "session=abcdef");
+        // 左闭右开。
+        assert_eq!(resolve_header_refs("{cookie:0-7}", &original), "session");
+        // 只有止：相当于前缀。
+        assert_eq!(resolve_header_refs("{cookie:-7}", &original), "session");
+        // 单个下标。
+        assert_eq!(resolve_header_refs("{cookie:1}", &original), "e");
+        // 越界收敛（不 panic、不截断错位）。
+        assert_eq!(resolve_header_refs("{cookie:100-}", &original), "");
+        assert_eq!(resolve_header_refs("{cookie:5-2}", &original), "");
+        assert_eq!(
+            resolve_header_refs("{cookie:-100}", &original),
+            "session=abcdef"
+        );
+    }
+
+    /// 不是引用的花括号必须**原样保留**（避免把 JSON 字面量吃掉），
+    /// 引用不存在的头则解析成空串。
+    #[test]
+    fn header_refs_keep_literals_and_degrade_missing() {
+        let original = vec![("x-token".to_string(), "abc".to_string())];
+        assert_eq!(resolve_header_refs(r#"{"a":1}"#, &original), r#"{"a":1}"#);
+        assert_eq!(resolve_header_refs("{cookie:b}", &original), "{cookie:b}");
+        assert_eq!(resolve_header_refs("no-ref", &original), "no-ref");
+        // 头不存在 ⇒ 空串（不能把占位符原样发给上游）。
+        assert_eq!(resolve_header_refs("[{nope:2-}]", &original), "[]");
+        // 没有闭合 `}` ⇒ 原样保留。
+        assert_eq!(resolve_header_refs("a_{x-token", &original), "a_{x-token");
+    }
+
+    /// `headers` 与 `user_agent` 一样是**可选字段**：旧清单不写它时按空配置处理。
+    #[test]
+    fn provider_headers_are_optional() {
+        let legacy: Provider = serde_json::from_value(serde_json::json!({
+            "name": "p1", "base_url": "http://x/v1", "type": "openai",
+            "auth": {"kind": "none"}, "tier": "paid", "models": []
+        }))
+        .expect("旧清单（无 headers）必须能解析");
+        assert!(legacy.headers.is_empty());
+        // 空配置序列化时整个键都省略（清单体积与旧版一致）。
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("headers").is_none());
+    }
 
     /// `user_agent` 是**新增的可选字段**：旧清单（完全没有这个键）必须照样能读，
     /// 语义是 `None`（透传调用方 UA）；写了值则原样带出。
