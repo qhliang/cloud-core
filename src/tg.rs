@@ -51,8 +51,9 @@ pub enum ProviderAuth {
 
 /// 服务商下的一个**具体模型**，可带若干标签。
 ///
-/// ⚠️ 标签是**自由字符串**（用户自定义），由管理端做去重/trim；
-/// 服务商组可以「按 tag」动态关联成员（见 [`GroupMembers`]）。
+/// ⚠️ 标签统一为 `key=value` 文本（如 `tier=cheap`），由管理端按全局标签字典
+/// 校验 key 与枚举值；服务商组可以「按 tag」动态关联成员（见 [`GroupMembers`]），
+/// 条件是 `key=value`（精确）或 `key=*`（通配）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderModel {
     pub name: String,
@@ -120,6 +121,23 @@ impl ProviderModel {
     /// 该模型是否带任一指定 tag（按 tag 关联服务商组时用）。
     pub fn has_any_tag(&self, tags: &[String]) -> bool {
         self.tags.iter().any(|t| tags.contains(t))
+    }
+
+    /// 是否满足一个组标签条件。
+    ///
+    /// - `key=*` ⇒ 模型带任意 `key=` 前缀的标签（**通配**，只用于组条件）；
+    /// - 其它 ⇒ 与某个标签**完全相等**（`key=value`，兼容旧的自由字符串）。
+    ///
+    /// ⚠️ 通配按**第一个** `=` 切分：`region=cn=1` 的 key 是 `region`、value 是
+    /// `cn=1`；标签值本身允许包含 `=`。
+    pub fn matches_tag_condition(&self, cond: &str) -> bool {
+        match cond.split_once('=') {
+            Some((key, "*")) => {
+                let prefix = format!("{key}=");
+                self.tags.iter().any(|t| t.starts_with(&prefix))
+            }
+            _ => self.tags.iter().any(|t| t == cond),
+        }
     }
 }
 
@@ -893,6 +911,28 @@ mod tests {
             p.models[0].tags,
             vec!["cheap".to_string(), "fast".to_string()]
         );
+    }
+
+    /// 组标签条件：`key=value` 精确匹配；`key=*` 按前缀通配。
+    #[test]
+    fn model_matches_tag_condition_exact_and_wildcard() {
+        let m = ProviderModel {
+            name: "m".into(),
+            tags: vec!["tier=cheap".into(), "region=cn=1".into()],
+        };
+        assert!(m.matches_tag_condition("tier=cheap"));
+        assert!(!m.matches_tag_condition("tier=free"));
+        // value 本身可以含 `=`（按第一个 `=` 切分）
+        assert!(m.matches_tag_condition("region=cn=1"));
+        // 通配：只匹配同一个 key
+        assert!(m.matches_tag_condition("tier=*"));
+        assert!(m.matches_tag_condition("region=*"));
+        assert!(!m.matches_tag_condition("other=*"));
+        // 旧自由字符串仍按精确匹配
+        assert!(!m.matches_tag_condition("cheap"));
+        // 空条件 / 裸 `*` 不命中
+        assert!(!m.matches_tag_condition(""));
+        assert!(!m.matches_tag_condition("*"));
     }
 
     /// 旧路由（provider + rewrite_model）⇒ 目标是 (服务商, rewrite_model)。
