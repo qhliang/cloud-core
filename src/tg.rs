@@ -563,11 +563,15 @@ impl std::fmt::Display for GroupStrategy {
 pub enum GroupMembers {
     /// 显式列出 `(服务商, 模型)`。
     ProviderModels { items: Vec<ModelRef> },
-    /// 按标签动态关联：成员 = 所有「模型带任一 tag」的 `(服务商, 模型)`。
+    /// 按标签组动态关联：`groups = [[a,b],[c]]` 表示 **(a 且 b) 或 c**。
+    ///
+    /// - **组内是「且」**：模型必须同时带该组的全部 tag 才命中；
+    /// - **组间是「或」**：命中任意一组即进组；
+    /// - 空组（`[]`）没有任何意义，保存期丢弃、运行期跳过（不能让它命中一切）。
     ///
     /// ⚠️ 动态成员意味着「给某个模型加 tag 后自动进组」——这正是 tag 的用途；
     /// 代价是组内成员会随服务商配置变化，管理端要展示「当前匹配 N 个」。
-    Tags { tags: Vec<String> },
+    Tags { groups: Vec<Vec<String>> },
 }
 
 /// A virtual provider that aggregates one or more real providers。
@@ -992,10 +996,13 @@ mod tests {
     #[test]
     fn group_members_tagged_union_roundtrip() {
         let tags = GroupMembers::Tags {
-            tags: vec!["cheap".into()],
+            groups: vec![vec!["cheap".into(), "fast".into()], vec!["vision".into()]],
         };
         let json = serde_json::to_value(&tags).unwrap();
         assert_eq!(json["kind"], "tags");
+        // 序列化只发 `groups`（嵌套数组），不再有扁平的 `tags`
+        assert_eq!(json["groups"][0][1], "fast");
+        assert!(json.get("tags").is_none());
         assert_eq!(serde_json::from_value::<GroupMembers>(json).unwrap(), tags);
 
         let items = GroupMembers::ProviderModels {
