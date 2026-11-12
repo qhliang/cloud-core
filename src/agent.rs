@@ -72,6 +72,17 @@ pub struct CreateTaskRequest {
     /// 缓存的远程 MCP 工具名（按 MCP 名称分组）；agent-manager 执行时与
     /// 内置 tools 合并写入 pi `--tools`。旧版本 agent-manager 忽略此字段。
     pub mcp_tools: HashMap<String, Vec<String>>,
+    /// 本次任务**覆盖**的 MCP 配置文件内容（MCP 名 → JSON 文本）。
+    ///
+    /// 与 `mcps` 配合使用：`mcps` 仍是「挂载哪些 MCP」的名单，而这里的条目
+    /// 覆盖全局 `/app/mcp/<name>.json`。用于需要**按任务**动态生成配置的场景
+    /// （例如集群管理 MCP 的授权范围必须编码进 SSE URL，不能全局共享）。
+    ///
+    /// ⚠️ 不在这里的 MCP 仍按旧路径从全局目录复制 —— 缺省空 map 即完全保持
+    /// 原行为。老版本 agent-manager 会忽略该字段（serde 默认放过未知字段），
+    /// 表现为「覆盖不生效但任务照常启动」；因此 cloud-manager 只应在目标
+    /// agent-manager 已升级后使用它。
+    pub mcp_configs: HashMap<String, String>,
     pub skills: Vec<String>,
     pub files: HashMap<String, String>,
     /// 任务初始文件的**引用**（内容存放在 cloud-manager 的 blobstore）。
@@ -792,6 +803,34 @@ mod session_field_compat_tests {
         assert_eq!(r.plan_yolo, None);
         assert_eq!(r.approval_mode, None);
         assert_eq!(r.thinking, None);
+    }
+
+    /// `mcp_configs` 缺省为空 map：老 payload 必须解析成功且不改变旧行为。
+    #[test]
+    fn mcp_configs_defaults_to_empty() {
+        let json = r#"{"task_id":"exec-1","prompt":"hi"}"#;
+        let r: CreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert!(r.mcp_configs.is_empty());
+    }
+
+    /// 按任务覆盖 MCP 配置必须能原样 round-trip（含 JSON 文本里的引号/换行）。
+    #[test]
+    fn mcp_configs_round_trip() {
+        let content = r#"{"cluster":{"type":"sse","url":"http://x/internal/mcp/sse?scope=a.b"}}"#;
+        let r = CreateTaskRequest {
+            task_id: "exec-1".into(),
+            prompt: "p".into(),
+            mcps: vec!["cluster".into()],
+            mcp_configs: HashMap::from([("cluster".to_string(), content.to_string())]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: CreateTaskRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.mcp_configs.get("cluster").map(String::as_str),
+            Some(content)
+        );
+        assert_eq!(back.mcps, vec!["cluster".to_string()]);
     }
 
     /// 四个参数齐全时正常 round-trip —— 防止有人手滑把 `#[serde(default)]` 弄丢。
