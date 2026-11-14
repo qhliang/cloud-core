@@ -123,22 +123,70 @@ impl ProviderModel {
         self.tags.iter().any(|t| tags.contains(t))
     }
 
-    /// 是否满足一个组标签条件。
+    /// 是否满足一个组标签条件（只看模型**自己的**标签）。
     ///
     /// - `key=*` ⇒ 模型带任意 `key=` 前缀的标签（**通配**，只用于组条件）；
     /// - 其它 ⇒ 与某个标签**完全相等**（`key=value`，兼容旧的自由字符串）。
     ///
     /// ⚠️ 通配按**第一个** `=` 切分：`region=cn=1` 的 key 是 `region`、value 是
     /// `cn=1`；标签值本身允许包含 `=`。
+    ///
+    /// ⚠️ 组匹配要用**生效标签**（服务商标签 + 模型标签），见 [`Provider::effective_tags`]。
     pub fn matches_tag_condition(&self, cond: &str) -> bool {
-        match cond.split_once('=') {
-            Some((key, "*")) => {
-                let prefix = format!("{key}=");
-                self.tags.iter().any(|t| t.starts_with(&prefix))
-            }
-            _ => self.tags.iter().any(|t| t == cond),
+        tag_matches(&self.tags, cond)
+    }
+}
+
+/// 判断一组 `key=value` 标签是否命中一个组条件（`key=value` 或 `key=*`）。
+///
+/// 抽成自由函数是因为「生效标签」是临时拼出来的（服务商标签 + 模型标签），
+/// 不一定属于某个 [`ProviderModel`] 实例。
+pub fn tag_matches(tags: &[String], cond: &str) -> bool {
+    match cond.split_once('=') {
+        Some((key, "*")) => {
+            let prefix = format!("{key}=");
+            tags.iter().any(|t| t.starts_with(&prefix))
+        }
+        _ => tags.iter().any(|t| t == cond),
+    }
+}
+
+/// 标签的 key（`key=value` 取第一个 `=` 之前；无 `=` 的旧格式整体作为 key）。
+fn tag_key(raw: &str) -> &str {
+    match raw.split_once('=') {
+        Some((k, _)) => k,
+        None => raw,
+    }
+}
+
+/// 合并「服务商级标签」与「模型标签」，得到生效标签。
+///
+/// 规则（与需求一致）：
+/// - 结果 = 服务商标签 + 模型标签；
+/// - **同一个 key 以模型标签为准**（模型覆盖服务商），且沿用服务商标签的位置；
+/// - 模型独有的 key 追加在末尾；
+/// - 保持各自原有顺序，结果去重。
+pub fn merge_tags(provider_tags: &[String], model_tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // 先放服务商标签（按 key 去重，后者覆盖前者）。
+    for raw in provider_tags {
+        let key = tag_key(raw);
+        if let Some(slot) = out.iter_mut().find(|t| tag_key(t) == key) {
+            *slot = raw.clone();
+        } else {
+            out.push(raw.clone());
         }
     }
+    // 模型标签：同 key 覆盖上面的值，否则追加。
+    for raw in model_tags {
+        let key = tag_key(raw);
+        if let Some(slot) = out.iter_mut().find(|t| tag_key(t) == key) {
+            *slot = raw.clone();
+        } else {
+            out.push(raw.clone());
+        }
+    }
+    out
 }
 
 /// 一条「新增请求头」配置。
@@ -334,6 +382,12 @@ pub struct Provider {
     /// 它是**选路的唯一模型来源**，不允许路由凭空写一个模型名。
     #[serde(default, deserialize_with = "models_compat")]
     pub models: Vec<ProviderModel>,
+    /// 服务商级标签（`key=value`）：对该服务商下**所有模型**生效。
+    ///
+    /// 模型的生效标签 = 服务商标签 + 模型自己的标签；**同一个 key 以模型标签为准**
+    /// （见 [`Provider::effective_tags`]）。
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub proxy: Option<String>,
     /// 可选：覆盖发往上游的 `user-agent`。`None` / 空 ⇒ **透传调用方**的值。
@@ -352,6 +406,13 @@ pub struct Provider {
     pub headers: HeaderConfig,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl Provider {
+    /// 某个模型在该服务商下的**生效标签** = 服务商标签 + 模型标签（同 key 模型覆盖）。
+    pub fn effective_tags(&self, model: &ProviderModel) -> Vec<String> {
+        merge_tags(&self.tags, &model.tags)
+    }
 }
 
 // ── Routes ────────────────────────────────────────────────
@@ -933,6 +994,48 @@ mod tests {
         // 空条件 / 裸 `*` 不命中
         assert!(!m.matches_tag_condition(""));
         assert!(!m.matches_tag_condition("*"));
+    }
+
+    /// 服务商级标签 + 模型标签：同 key 模型覆盖，其余合并。
+    #[test]
+    fn merge_tags_model_overrides_provider_by_key() {
+        let merged = super::merge_tags(
+            &["tier=cheap".into(), "region=cn".into(), "org=pub".into()],
+            &["tier=pro".into(), "vision=1".into()],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "tier=pro".to_string(),
+                "region=cn".to_string(),
+                "org=pub".to_string(),
+                "vision=1".to_string(),
+            ]
+        );
+    }
+
+    /// 生效标签参与组条件匹配（含通配），服务商标签对每个模型都生效。
+    #[test]
+    fn provider_tags_apply_to_every_model() {
+        let p: Provider = serde_json::from_value(serde_json::json!({
+            "name": "p1", "base_url": "http://x/v1", "type": "openai",
+            "auth": {"kind": "none"}, "tier": "paid",
+            "tags": ["tier=cheap", "region=cn"],
+            "models": [
+                {"name": "m1", "tags": []},
+                {"name": "m2", "tags": ["tier=pro"]}
+            ]
+        }))
+        .unwrap();
+        let m1 = p.effective_tags(&p.models[0]);
+        assert!(super::tag_matches(&m1, "tier=cheap"));
+        assert!(super::tag_matches(&m1, "region=*"));
+        let m2 = p.effective_tags(&p.models[1]);
+        // 同 key 模型覆盖服务商
+        assert!(super::tag_matches(&m2, "tier=pro"));
+        assert!(!super::tag_matches(&m2, "tier=cheap"));
+        // 服务商其它标签仍然继承
+        assert!(super::tag_matches(&m2, "region=cn"));
     }
 
     /// 旧路由（provider + rewrite_model）⇒ 目标是 (服务商, rewrite_model)。
