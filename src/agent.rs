@@ -97,6 +97,11 @@ pub struct CreateTaskRequest {
     /// 反过来老版本 agent-manager 收到后会**忽略**它（serde 默认放过未知字段），
     /// 即「新版 cloud-manager → 老版 agent-manager」只是不生效，不会报错。
     pub env: HashMap<String, String>,
+    /// 执行超时（秒）。**`0` = 不设上限**：agent-manager 不启动超时看门狗、
+    /// 队列侧也无截止时间等待终态，只有手动停止或进程自行退出才结束。
+    ///
+    /// ⚠️ 旧版 agent-manager 会拒绝 0（`timeout_secs must be greater than zero`），
+    /// 所以「不限制超时」只应在目标节点已升级后使用。
     pub timeout_secs: u64,
     pub memory_limit_mb: u64,
     // ── 项目记忆（memory bank）────────────────────────────────────────────
