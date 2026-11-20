@@ -187,6 +187,12 @@ pub struct TaskEnvelope {
 
 impl TaskEnvelope {
     /// 信封版本。
+    ///
+    /// ⚠️ **必须与 `cloud_core::PROTOCOL_VERSION` 相同**。两个 crate 互不依赖
+    /// （根包不得引入运行时依赖，队列库也不该被协议类型绑死），所以这个数字
+    /// 是**第二处字面量**，一致性由下游仓（同时依赖两个 crate）的测试断言。
+    ///
+    /// 追加字段（向后兼容）不需要 +1；改名 / 改语义 / 改必填性才需要。
     pub const SCHEMA_VERSION: u32 = 1;
     /// 唯一支持的负载编码。
     pub const ENCODING_BASE64: &str = "base64";
@@ -222,6 +228,25 @@ impl TaskEnvelope {
         }
         base64_decode(&self.payload).map_err(|_| PayloadError::InvalidBase64)
     }
+
+    /// 校验信封版本是否被本消费者支持。
+    ///
+    /// 消费者在**解码负载之前**必须调用：信封能 `serde` 解析成功不代表语义
+    /// 兼容——改名后的字段会被当成缺失、改语义的字段会被按旧含义执行，都是
+    /// 静默错误。版本号是唯一能在运行时区分这两种情况的信号。
+    ///
+    /// 只拒绝「生产者比消费者新」（`got > supported`）。更旧的版本在
+    /// [`TaskEnvelope::SCHEMA_VERSION`] 仍是 1 时不会出现；将来出现时按
+    /// 同样的方式拒绝即可——**不做隐式降级**，因为旧结构缺的字段无法凭空补出。
+    pub fn check_schema_version(&self) -> Result<(), SchemaMismatch> {
+        if self.schema_version > Self::SCHEMA_VERSION {
+            return Err(SchemaMismatch {
+                got: self.schema_version,
+                supported: Self::SCHEMA_VERSION,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// 负载解码错误。
@@ -245,6 +270,31 @@ impl std::fmt::Display for PayloadError {
 }
 
 impl std::error::Error for PayloadError {}
+
+/// 信封版本不兼容：生产者比消费者新。
+///
+/// 消费者把它当作**系统级失败**处理（不是业务失败）：任务本身没做错任何事，
+/// 是部署里的两个服务版本不一致。文案必须带上两个数字，否则运维只能看到
+/// 「任务失败」而不知道该升级哪一端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaMismatch {
+    /// 生产者写入的版本。
+    pub got: u32,
+    /// 本消费者支持的版本。
+    pub supported: u32,
+}
+
+impl std::fmt::Display for SchemaMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "protocol version mismatch: producer={}, consumer={} —— 两端的 cloud-core 版本不一致，请先升级消费者",
+            self.got, self.supported
+        )
+    }
+}
+
+impl std::error::Error for SchemaMismatch {}
 
 /// 任务对外状态视图。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -605,5 +655,30 @@ mod tests {
             assert_eq!(parsed, source);
         }
         assert!("nope".parse::<AttemptErrorSource>().is_err());
+    }
+
+    #[test]
+    fn accepts_same_and_older_schema_versions() {
+        let mut envelope = TaskEnvelope::new("task-1", b"hi".to_vec(), 0);
+        assert_eq!(envelope.schema_version, TaskEnvelope::SCHEMA_VERSION);
+        assert!(envelope.check_schema_version().is_ok());
+
+        envelope.schema_version = 0;
+        assert!(envelope.check_schema_version().is_ok(), "旧版本不得被拒");
+    }
+
+    #[test]
+    fn rejects_newer_schema_version_with_both_numbers() {
+        let mut envelope = TaskEnvelope::new("task-1", b"hi".to_vec(), 0);
+        envelope.schema_version = TaskEnvelope::SCHEMA_VERSION + 1;
+
+        let err = envelope.check_schema_version().expect_err("必须拒绝");
+        assert_eq!(err.got, TaskEnvelope::SCHEMA_VERSION + 1);
+        assert_eq!(err.supported, TaskEnvelope::SCHEMA_VERSION);
+
+        // 文案必须同时带两个数字：运维要据此判断升级哪一端。
+        let msg = err.to_string();
+        assert!(msg.contains(&err.got.to_string()), "{msg}");
+        assert!(msg.contains(&err.supported.to_string()), "{msg}");
     }
 }

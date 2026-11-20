@@ -325,6 +325,27 @@ impl Consumer {
                 return;
             }
         };
+        // ── 协议版本闸门 ──
+        // 必须在解码负载**之前**：信封能 `serde` 解析成功不代表语义兼容。
+        // 改名后的字段会被当成缺失、改语义的字段会被按旧含义执行，两者都是
+        // 静默错误。处置与「信封无法解析」一致（终结 + 上报终态）：一个本端
+        // 无法安全执行的任务留在队列里只会反复失败，且掩盖真正的原因。
+        if let Err(err) = envelope.check_schema_version() {
+            tracing::error!(
+                task_id = %task_id,
+                err = %err,
+                "task envelope protocol mismatch"
+            );
+            let error = err.to_string();
+            self.publish_attempt_failed(&task_id, attempt, AttemptErrorSource::System, &error)
+                .await;
+            self.publish_pre_context_terminate(&task_id, attempt, &error)
+                .await;
+            self.mark_terminal(&task_id, TaskState::Failed).await;
+            let _ = AckAction::Term.apply(&acker).await;
+            return;
+        }
+
         let payload = match envelope.decode_payload() {
             Ok(payload) => payload,
             Err(err) => {

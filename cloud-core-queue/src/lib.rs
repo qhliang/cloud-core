@@ -53,8 +53,8 @@ pub use nats::{
 };
 pub use producer::Producer;
 pub use types::{
-    AttemptErrorSource, AttemptFailure, AttemptFailureRecord, PayloadError, Task, TaskEnvelope,
-    TaskError, TaskErrorSource, TaskInfo, TaskMeta, TaskOutput, TaskState, TaskStatus,
-    base64_decode, base64_encode,
+    AttemptErrorSource, AttemptFailure, AttemptFailureRecord, PayloadError, SchemaMismatch, Task,
+    TaskEnvelope, TaskError, TaskErrorSource, TaskInfo, TaskMeta, TaskOutput, TaskState,
+    TaskStatus, base64_decode, base64_encode,
 };
 pub use worker::{CancellationSource, HeartbeatSink, TaskContext, Worker};
