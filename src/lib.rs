@@ -4,6 +4,8 @@
 //! 之间的请求/响应结构定义（仅数据结构 + serde，不含任何业务逻辑）。
 
 pub mod agent;
+#[cfg(feature = "gateway")]
+pub mod gateway;
 pub mod tg;
 pub mod workflow;
 

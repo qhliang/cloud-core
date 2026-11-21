@@ -1,16 +1,22 @@
 [package]
 name = "cloud-core"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 
 [lib]
 name = "cloud_core"
 path = "src/lib.rs"
 
+[features]
+# 网关配置契约（`src/gateway.rs`）：需要 `http` 做 URI / header 校验。
+# **默认不启用** —— 根包必须能编到 wasm32-wasip2（CI 的 wasm-root job）。
+gateway = ["dep:http"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+http = { version = "1", optional = true }
 
 # ⚠️ 本仓是 workspace 根，且**同时**是一个包（根包）。这样既能把
 # `cloud-core-queue` 收进同一仓、共享一次发布，又不破坏既有消费者 ——
