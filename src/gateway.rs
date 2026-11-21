@@ -151,7 +151,7 @@ pub fn validate(doc: WireDocument) -> Result<WireDocument, Vec<RouteError>> {
 fn normalize_route(route: WireRoute) -> Result<WireRoute, Vec<RouteError>> {
     let mut errors = Vec::new();
 
-    let token = match normalize_token(&route.token) {
+    let token = match validate_token(&route.token) {
         Ok(v) => v,
         Err(message) => {
             errors.push(RouteError {
@@ -232,7 +232,12 @@ fn normalize_route(route: WireRoute) -> Result<WireRoute, Vec<RouteError>> {
     })
 }
 
-fn normalize_token(raw: &str) -> Result<String, String> {
+/// 校验并规范化一个 token（路由 token 与网关配置 token 共用同一套规则）。
+///
+/// 单独公开：网关的 `CONFIG_TOKEN` 不属于任何路由，但它的合法性约束必须与
+/// 路由 token 一致 —— 两处各写一份会出现「路由 token 允许、配置 token 不允许」
+/// 这种难以解释的不一致。
+pub fn validate_token(raw: &str) -> Result<String, String> {
     let token = raw.trim();
     if token.is_empty() {
         return Err("token 不能为空".to_string());
