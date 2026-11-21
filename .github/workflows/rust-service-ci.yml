@@ -1,0 +1,381 @@
+# 四个原生服务（agent-manager / workflow-manager / tokengateway / cloud-manager）
+# 共用的 CI：guard → version → prepare（可选前端）→ fmt / test / clippy → image。
+#
+# # 为什么放 cloud-core
+#
+# 四个仓都已经 git 依赖 cloud-core，把共享流水线放在这里不需要新开仓库；
+# 且改动它的人本来就得先动 cloud-core。
+#
+# # 版本钉法
+#
+# 调用方写成 `uses: qhliang/cloud-core/.github/workflows/rust-service-ci.yml@v1`。
+# **不要用 `@main`**：那意味着改 cloud-core 的一次提交会同时改变四个仓的发布
+# 行为，而且没有 review 窗口。不兼容改动（新增必填 input、改 job 名）时打 `v2`，
+# 四个仓逐个改；兼容改动直接移动 `v1` tag。
+#
+# # ⚠️ 切换的运维副作用
+#
+# 复用 workflow 后，job 在分支保护里显示为 `ci / guard`、`ci / test` 这种形式，
+# **四个仓的 required status checks 都要在 GitHub 后台重配** —— 否则 PR 会
+# 一直显示「等待必需检查」。
+name: Rust Service CI
+
+on:
+  workflow_call:
+    inputs:
+      # 版本号来源的包名（`cargo metadata` 里 select 的 name）。
+      package_name:
+        type: string
+        required: true
+      # GHCR / ACR 的镜像名**故意分开**：tokengateway 与 cloud-manager 两边不同名。
+      ghcr_image:
+        type: string
+        required: true
+      acr_image:
+        type: string
+        required: true
+      # 逗号分隔的包名；非空时断言这些包的 version 完全一致。
+      # cloud-manager 用它保证 bin 与 core 两个 package 同步递增。
+      version_packages:
+        type: string
+        default: ''
+      needs_frontend:
+        type: boolean
+        default: false
+      frontend_dir:
+        type: string
+        default: 'frontend'
+      static_dir:
+        type: string
+        default: 'cloud-manager-core/static'
+      # 静态 build-arg（来自调用方的 vars.*），JSON 对象。
+      # 计算出来的值（版本 / commit）由本文件无条件注入。
+      build_args_json:
+        type: string
+        default: '{}'
+      rust_version:
+        type: string
+        default: '1.97.0'
+      # checksum：tokengateway 用 stable rustfmt、其余用 nightly。
+      fmt_channel:
+        type: string
+        default: 'nightly'
+      platform:
+        type: string
+        default: 'linux/amd64'
+      # 测试命令覆盖。默认跑整个 workspace；个别仓有跑不了的 target（如
+      # tokengateway 的 17 个 fixture 测试依赖未入库的 fixtures/ 目录），
+      # 只能按包选择。
+      test_cmd:
+        type: string
+        default: 'cargo test --workspace --all-targets && cargo test --workspace --doc'
+    secrets:
+      ALIYUN_ACR_USERNAME:
+        required: false
+      ALIYUN_ACR_PASSWORD:
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+  GHCR_REGISTRY: ghcr.io
+  ALIYUN_ACR_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  ALIYUN_ACR_NAMESPACE: big_bumblebee
+
+jobs:
+  # ── 依赖守卫 ──────────────────────────────────────────────
+  # 两个 cloud-core 依赖必须 git + 同一个 40 位 rev。只改其中一处会在同一份
+  # 构建里产生两份 cloud-core 工作区（同名不同类型的经典来源），而报错与真因
+  # 相距很远。这条守卫就是 P0-1b 的护栏。
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_version }}
+      - name: Workspace manifest must resolve
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 > /dev/null
+          echo 'OK: workspace metadata resolved'
+      - name: No path dependencies escaping the repo
+        run: |
+          set -euo pipefail
+          BAD=$(grep -rnE '^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*\{[^}]*path[[:space:]]*=[[:space:]]*"\.\./\.\./' --include=Cargo.toml . || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::检出跨仓 path 依赖，CI 无法解析："
+            echo "$BAD"
+            exit 1
+          fi
+          echo 'OK: no escaping path dependencies'
+      - name: cloud-core deps pin one shared 40-hex rev
+        run: |
+          set -euo pipefail
+          REVS=$(grep -rhoE 'cloud-core(-queue)?[[:space:]]*=[[:space:]]*\{[^}]*rev[[:space:]]*=[[:space:]]*"[0-9a-f]{40}"' --include=Cargo.toml . \
+                 | grep -oE '[0-9a-f]{40}"$' | tr -d '"' | sort -u)
+          COUNT=$(printf '%s\n' "${REVS}" | grep -c . || true)
+          if [ "${COUNT}" -ne 1 ]; then
+            echo "::error::cloud-core / cloud-core-queue 的 rev 不一致或缺失（找到 ${COUNT} 个不同值）："
+            printf '%s\n' "${REVS}"
+            exit 1
+          fi
+          echo "OK: both cross-repo deps pin ${REVS}"
+
+  # ── 版本号 ────────────────────────────────────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_version }}
+      - name: Resolve version from Cargo.toml
+        id: resolve
+        env:
+          PKG: ${{ inputs.package_name }}
+          PKGS: ${{ inputs.version_packages }}
+        run: |
+          set -euo pipefail
+          VER=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg p "$PKG" '.packages[] | select(.name == $p) | .version')
+          if [ -z "$VER" ] || [ "$VER" = "null" ]; then
+            echo "::error::无法从 cargo metadata 解析 $PKG 的 version"
+            exit 1
+          fi
+          # 多个 package 必须同版本：CI 只按一个包打 tag，另一个漂移时镜像 tag
+          # 与 deployment.yaml 对不上 ⇒ 线上 ImagePullBackOff，而构建全程绿灯。
+          if [ -n "${PKGS}" ]; then
+            IFS=',' read -ra LIST <<< "${PKGS}"
+            for p in "${LIST[@]}"; do
+              p_trim="$(echo "$p" | xargs)"
+              [ -z "$p_trim" ] && continue
+              v=$(cargo metadata --no-deps --format-version 1 \
+                | jq -r --arg p "$p_trim" '.packages[] | select(.name == $p) | .version')
+              if [ "$v" != "$VER" ]; then
+                echo "::error::版本号不一致：$PKG=$VER vs $p_trim=$v —— 必须同步递增"
+                exit 1
+              fi
+            done
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "resolved version: ${VER}"
+
+  # ── 可选的前端 ────────────────────────────────────────────
+  # ⚠️ 这个 job **永远存在**，`if:` 只放在步骤上。
+  # 若在 job 级写 `if: inputs.needs_frontend`，job 被 skip 时所有 `needs` 它的
+  # job 会**一起被 skip** —— 结果是 clippy / test 静默不跑，而整条流水线还是绿的。
+  prepare:
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - if: inputs.needs_frontend
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ inputs.frontend_dir }}/package-lock.json
+      - if: inputs.needs_frontend
+        name: Install frontend deps
+        working-directory: ${{ inputs.frontend_dir }}
+        run: npm ci
+      - if: inputs.needs_frontend
+        name: Lint frontend
+        working-directory: ${{ inputs.frontend_dir }}
+        run: npm run lint
+      - if: inputs.needs_frontend
+        name: Frontend unit tests
+        working-directory: ${{ inputs.frontend_dir }}
+        run: npm run test
+      - if: inputs.needs_frontend
+        name: Build frontend
+        working-directory: ${{ inputs.frontend_dir }}
+        env:
+          VITE_APP_VERSION: ${{ needs.version.outputs.version }}
+          VITE_APP_COMMIT: ${{ github.sha }}
+        run: npm run build
+      - if: inputs.needs_frontend
+        name: Verify frontend output landed where rust-embed expects
+        run: |
+          set -euo pipefail
+          test -f "${{ inputs.static_dir }}/index.html" \
+            || { echo "::error::前端产物未落到 ${{ inputs.static_dir }}/index.html"; exit 1; }
+      - if: inputs.needs_frontend
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-static
+          path: ${{ inputs.static_dir }}
+
+  fmt:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # components 不能省：dtolnay/rust-toolchain 默认 minimal profile，不含 rustfmt。
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.fmt_channel }}
+          components: rustfmt
+      - name: Cargo fmt check
+        run: cargo "+${{ inputs.fmt_channel }}" fmt --all --check
+
+  clippy:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_version }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - if: inputs.needs_frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-static
+          path: ${{ inputs.static_dir }}
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    env:
+      # wasmtime / spin 的 debug 产物很大，GitHub runner 磁盘只有 ~14GB，
+      # 默认 debuginfo + incremental 会在链接阶段把磁盘打满。
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - if: inputs.needs_frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-static
+          path: ${{ inputs.static_dir }}
+      - name: Cargo test
+        # 默认命令见 workflow_call.inputs.test_cmd 的注释。
+        run: |
+          set -euo pipefail
+          ${{ inputs.test_cmd }}
+
+  # ── 镜像 ──────────────────────────────────────────────────
+  image:
+    # 等 fmt / clippy / test 全部通过再推镜像：测试失败时镜像不该已经在 registry
+    # 上（tag 一旦存在，重跑会让人误以为「这个版本已经验过」）。
+    needs: [version, fmt, clippy, test]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      HAS_ACR_SECRET: ${{ secrets.ALIYUN_ACR_USERNAME != '' && secrets.ALIYUN_ACR_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          SHA_SHORT=$(git rev-parse --short=8 HEAD)
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="sha-${SHA_SHORT}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+        id: buildx
+      # 构建**一次**到本地，再 tag/push 到两个 registry。rust builder 阶段
+      # 动辄数分钟，构建两次会让 CI 时间直接翻倍。
+      - name: Build image once
+        env:
+          BUILD_ARGS: ${{ inputs.build_args_json }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ARGS=(--load --platform "${{ inputs.platform }}" --provenance=false --sbom=false)
+          ARGS+=(--builder "${{ steps.buildx.outputs.name }}")
+          # 静态 build-arg（调用方 vars.*）：空值不传，避免把空字符串烘进镜像。
+          while IFS=$'\t' read -r k v; do
+            [ -z "$k" ] && continue
+            [ -z "$v" ] && continue
+            ARGS+=(--build-arg "${k}=${v}")
+          done < <(printf '%s' "$BUILD_ARGS" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+          # 计算值无条件注入：没声明这些 ARG 的 Dockerfile 会忽略它们。
+          ARGS+=(--build-arg "VITE_APP_VERSION=${VERSION}")
+          ARGS+=(--build-arg "VITE_APP_COMMIT=${GITHUB_SHA}")
+          ARGS+=(--build-arg "GIT_HASH=${GITHUB_SHA:0:8}")
+          ARGS+=(--label "org.opencontainers.image.version=${VERSION}")
+          ARGS+=(-t "${{ inputs.ghcr_image }}:local")
+          docker buildx build "${ARGS[@]}" .
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # 三个 tag：sha（回滚到确切 commit 用）、版本号（Deployment 引用）、latest。
+      - name: Push to GHCR
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          IMG: ${{ inputs.ghcr_image }}
+        run: |
+          set -euo pipefail
+          REPO="${GHCR_REGISTRY}/${{ github.repository_owner }}/${IMG}"
+          for t in "$TAG" "$VERSION" latest; do
+            docker tag "${IMG}:local" "${REPO}:${t}"
+            docker push "${REPO}:${t}"
+          done
+      - name: Login to Aliyun ACR
+        if: env.HAS_ACR_SECRET == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_ACR_REGISTRY }}
+          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+      - name: Push to Aliyun ACR
+        if: env.HAS_ACR_SECRET == 'true'
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          IMG: ${{ inputs.acr_image }}
+        run: |
+          set -euo pipefail
+          REPO="${ALIYUN_ACR_REGISTRY}/${ALIYUN_ACR_NAMESPACE}/${IMG}"
+          for t in "$TAG" "$VERSION" latest; do
+            docker tag "${{ inputs.ghcr_image }}:local" "${REPO}:${t}"
+            docker push "${REPO}:${t}"
+          done
+      # 部署清单应当钉 digest 而非 tag（tag 可变、节点 IfNotPresent 会留旧镜像）。
+      # ⚠️ 必须问 registry 要 digest —— `--load` / `--metadata-file` 给的是本地
+      # manifest 的 digest，抄进 deployment 会 ImagePullBackOff。
+      # ⚠️ 只打印，不自动改 deployment.yaml：改镜像属部署动作，要人确认。
+      - name: Record image digest
+        if: env.HAS_ACR_SECRET == 'true'
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          IMG: ${{ inputs.acr_image }}
+        run: |
+          set -euo pipefail
+          REPO="${ALIYUN_ACR_REGISTRY}/${ALIYUN_ACR_NAMESPACE}/${IMG}"
+          DIGEST=$(docker buildx imagetools inspect "${REPO}:${TAG}" \
+                   --format '{{json .Manifest.Digest}}' | tr -d '"')
+          {
+            echo "### ${IMG}"
+            echo
+            echo '```'
+            echo "${REPO}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
