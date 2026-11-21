@@ -35,6 +35,7 @@ MANIFESTS=(
     "cloud_manager/cloud-manager-core/Cargo.toml"
     "tokengateway/crates/core-types/Cargo.toml"
     "tokengateway/crates/tokengateway/Cargo.toml"
+    "gateway-proxy/Cargo.toml"
 )
 
 PATTERN='(git = "https://github\.com/qhliang/cloud-core\.git", rev = ")[0-9a-f]{40}(")'
