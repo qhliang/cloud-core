@@ -398,6 +398,15 @@ pub struct AgentRuntimeConfig {
     /// provider 请求超时秒数；0 表示不设限。默认 60s（云厂商）/ 600s（本地）。
     #[serde(default)]
     pub request_timeout_secs: u64,
+    /// pi 的同模型重试次数（写入任务 `settings.json` 的 `retry.max_retries`）。
+    ///
+    /// `None` = 未配置，消费方回退到自己的默认值（agent-manager 本地配置 /
+    /// 环境变量，缺省 3）。`0` = 显式关闭重试。
+    ///
+    /// ⚠️ pi 的 `retry_count` 是**每条用户消息**共享的预算，不是每轮重置；
+    /// 调大只在失败路径上多花时间，成功路径零成本。
+    #[serde(default)]
+    pub retry_max_retries: Option<u32>,
     /// 扩展思考级别：off / minimal / low / medium / high / xhigh / max。
     #[serde(default)]
     pub thinking: String,
@@ -454,6 +463,7 @@ impl Default for AgentRuntimeConfig {
             plan_yolo: false,
             approval_mode: "always-ask".to_string(),
             request_timeout_secs: 60,
+            retry_max_retries: None,
             thinking: "medium".to_string(),
             system_prompt: String::new(),
             append_system_prompt: String::new(),
