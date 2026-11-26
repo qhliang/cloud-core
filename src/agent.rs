@@ -202,6 +202,14 @@ pub struct CreateTaskRequest {
     /// 扩展思考级别（pi `--thinking`）。只允许 [`THINKING_LEVELS`]。
     #[serde(default)]
     pub thinking: Option<String>,
+    /// 本轮只做**上下文压缩**（不跑 prompt）。
+    ///
+    /// 由 WebUI 的「上下文占用圆环 → 点击压缩」派发的维护任务使用：
+    /// agent-manager 收到后向 pi 发 `compact`，不写 prompt；会话包仍会正常回传。
+    /// 老版本 agent-manager 忽略该字段（serde 默认放过未知字段）⇒ 降级为
+    /// 「空 prompt 的普通轮次」，不会误删会话数据。
+    #[serde(default)]
+    pub compact_session: bool,
 }
 
 /// 工具审批模式的**合法取值**。
@@ -789,6 +797,7 @@ mod session_field_compat_tests {
     #[test]
     fn session_fields_round_trip() {
         let r = CreateTaskRequest {
+            compact_session: false,
             task_id: "exec-1".into(),
             prompt: "p".into(),
             session_enabled: true,
@@ -833,6 +842,7 @@ mod session_field_compat_tests {
     fn mcp_configs_round_trip() {
         let content = r#"{"cluster":{"type":"sse","url":"http://x/internal/mcp/sse?scope=a.b"}}"#;
         let r = CreateTaskRequest {
+            compact_session: false,
             task_id: "exec-1".into(),
             prompt: "p".into(),
             mcps: vec!["cluster".into()],
@@ -852,6 +862,7 @@ mod session_field_compat_tests {
     #[test]
     fn run_params_round_trip() {
         let r = CreateTaskRequest {
+            compact_session: false,
             task_id: "exec-1".into(),
             prompt: "p".into(),
             plan_mode: Some(true),
